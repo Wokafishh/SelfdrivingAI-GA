@@ -9,6 +9,3 @@ Python-implementation av tre olika angreppssätt för att träna en robot att na
 ## Teknikstack
 - PyTorch
 - Webots (används för RL-träningen)
-
-## Kom igång
-[instruktioner för installation/körning]
