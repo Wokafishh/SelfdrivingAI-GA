@@ -12,7 +12,11 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from arkitektur import DrivingNetwork
 
 
-def train(epochs: int = 100, lr: float = 1e-3) -> dict:
+def setup(lr: float = 1e-3):
+    """
+    Sets up the model, optimizer, data, and single-iteration step function.
+    `run_training.py` handles loops, disk saving, Ctrl+C, and resuming.
+    """
     torch.manual_seed(42)
     images = torch.randn(3, 3, 64, 64)
     distances = torch.tensor([[0.2], [1.5], [5.0]])
@@ -30,23 +34,15 @@ def train(epochs: int = 100, lr: float = 1e-3) -> dict:
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    start_loss = None
-
-    for epoch in range(epochs):
+    def train_step(epoch: int) -> float:
+        """Executes a single training iteration and returns the step loss."""
         optimizer.zero_grad()
         pred_left, pred_right = model(images, distances)
 
         loss = criterion(pred_left, expert_left) + criterion(pred_right, expert_right)
-
-        if epoch == 0:
-            start_loss = loss.item()
-
         loss.backward()
         optimizer.step()
 
-    return {
-        "name": "Behaviour Cloning (BC)",
-        "iterations": epochs,
-        "start_loss": start_loss,
-        "final_loss": loss.item()
-    }
+        return loss.item()
+
+    return model, train_step, "Behaviour Cloning (BC)"
