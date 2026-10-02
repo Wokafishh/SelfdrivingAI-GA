@@ -10,12 +10,12 @@ Outputs:
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class DrivingNetwork(nn.Module):
     def __init__(self, in_channels: int = 3):
-        super(DrivingNetwork, self).__init__()
+        super().__init__()
 
         # 1. Feature extraction from 64x64 image
         self.cnn = nn.Sequential(

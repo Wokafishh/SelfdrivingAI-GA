@@ -4,9 +4,9 @@ Behaviour Cloning (BC) Training Module
 
 import sys
 from pathlib import Path
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn, optim
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from arkitektur import DrivingNetwork

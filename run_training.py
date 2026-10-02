@@ -3,10 +3,10 @@ Main training runner wrapper script with centralized lifecycle management,
 live checkpointing, auto-resuming, and health diagnostics.
 """
 
-import sys
 import argparse
 import importlib
 from pathlib import Path
+
 import torch
 
 # ==============================================================================
