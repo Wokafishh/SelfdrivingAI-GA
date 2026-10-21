@@ -5,12 +5,15 @@ Inputs:
   - Distance sensor reading to closest object
 
 Outputs:
-  - left_wheel:  float [-1.0 to 1.0] (reverse to forward)
-  - right_wheel: float [-1.0 to 1.0] (reverse to forward)
+  - left_wheel:  int [-1, 0, 1] (reverse to forward)
+  - right_wheel: int [-1, 0, 1] (reverse to forward)
 """
 
 import torch
 from torch import nn
+
+# Mapping index [0, 1, 2] -> discrete actions [-1, 0, 1]
+ACTIONS = [-1, 0, 1]
 
 
 class DrivingNetwork(nn.Module):
@@ -19,10 +22,16 @@ class DrivingNetwork(nn.Module):
 
         # 1. Feature extraction from 64x64 image
         self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=5, stride=2, padding=2),
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=32,
+                kernel_size=5,
+                stride=2,
+                padding=2,
+            ),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.MaxPool2d(kernel_size=2, stride=2),
         )
 
         # Flattened CNN size: 32 channels * 16 * 16 = 8192
@@ -40,20 +49,19 @@ class DrivingNetwork(nn.Module):
             nn.Linear(512, 512),
             nn.ReLU(),
             nn.Linear(512, 512),
-            nn.ReLU()
+            nn.ReLU(),
         )
 
-        # 3. Output heads for left and right wheels
-        self.left_wheel_head = nn.Sequential(
-            nn.Linear(512, 1),
-            nn.Tanh()
-        )
-        self.right_wheel_head = nn.Sequential(
-            nn.Linear(512, 1),
-            nn.Tanh()
-        )
+        # 3. Output heads producing logits for 3 discrete actions [-1, 0, 1]
+        self.left_wheel_head = nn.Linear(512, 3)
+        self.right_wheel_head = nn.Linear(512, 3)
 
-    def forward(self, image: torch.Tensor, distance: torch.Tensor):
+    def forward(
+        self, image: torch.Tensor, distance: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if distance.dim() == 1:
+            distance = distance.unsqueeze(1)
+
         # Extract visual features
         x_img = self.cnn(image)
         x_img = torch.flatten(x_img, start_dim=1)
@@ -64,43 +72,49 @@ class DrivingNetwork(nn.Module):
         # Dense layers
         x = self.hidden(x)
 
-        # Compute outputs [-1 to 1]
-        left_wheel = self.left_wheel_head(x)
-        right_wheel = self.right_wheel_head(x)
+        # Compute action logits shape: (batch_size, 3)
+        left_logits = self.left_wheel_head(x)
+        right_logits = self.right_wheel_head(x)
 
-        return left_wheel, right_wheel
+        return left_logits, right_logits
 
     @torch.no_grad()
-    def get_action(self, image_tensor: torch.Tensor, distance_val: float) -> tuple[float, float]:
-        """
-        Convenience method to pass a single frame + distance float from your game/sim loop
-        and return standard Python float actions for the wheels.
-        """
+    def get_action(
+        self, image_tensor: torch.Tensor, distance_val: float
+    ) -> tuple[int, int]:
+        """Convenience method to pass a single frame + distance float from your
+        game/sim loop and return discrete integer actions [-1, 0, 1] for the
+        wheels."""
         self.eval()
 
-        # Add batch dimension if passing a single image (3, 64, 64) -> (1, 3, 64, 64)
+        # Add batch dimension if passing a single image (C, 64, 64) -> (1, C, 64, 64)
         if image_tensor.dim() == 3:
             image_tensor = image_tensor.unsqueeze(0)
 
-        # Convert distance scalar float into tensor shape (1, 1)
-        dist_tensor = torch.tensor([[distance_val]], dtype=torch.float32)
+        # Convert distance scalar float into tensor shape (1, 1) matching device
+        dist_tensor = torch.tensor(
+            [[distance_val]], dtype=torch.float32, device=image_tensor.device
+        )
 
         # Run inference
-        left_out, right_out = self.forward(image_tensor, dist_tensor)
+        left_logits, right_logits = self.forward(image_tensor, dist_tensor)
 
-        # Return clean Python floats
-        return left_out.item(), right_out.item()
+        # Pick class index with max probability and map to [-1, 0, 1]
+        left_idx = torch.argmax(left_logits, dim=1).item()
+        right_idx = torch.argmax(right_logits, dim=1).item()
 
-# Litet blaj test
+        return ACTIONS[left_idx], ACTIONS[right_idx]
+
+
+# Test execution
 if __name__ == "__main__":
-    # Test network initialization
     model = DrivingNetwork(in_channels=3)
 
     # Simulate 1 frame from game/sensor
     dummy_frame = torch.randn(3, 64, 64)  # (C, H, W)
-    dummy_distance = 2.4                 # Distance to wall in meters/units
+    dummy_distance = 2.4  # Distance to wall in meters/units
 
-    left_speed, right_speed = model.get_action(dummy_frame, dummy_distance)
+    left_action, right_action = model.get_action(dummy_frame, dummy_distance)
 
-    print(f"Left Wheel Action:  {left_speed:.2f}")   # e.g., -0.74 (reverse)
-    print(f"Right Wheel Action: {right_speed:.2f}")  # e.g.,  0.81 (forward)
+    print(f"Left Wheel Action:  {left_action}")  # Integer: -1, 0, or 1
+    print(f"Right Wheel Action: {right_action}")  # Integer: -1, 0, or 1

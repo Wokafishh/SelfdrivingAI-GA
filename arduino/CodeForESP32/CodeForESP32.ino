@@ -19,21 +19,25 @@ const WiFiCredential wifiNetworks[] = {
 const size_t numNetworks = sizeof(wifiNetworks) / sizeof(wifiNetworks[0]);
 
 const char* TARGET_HOST = "larvtop";
-const int   TARGET_PORT = 8000;
-const int   CONTROL_PORT = 8001;
+const int    TARGET_PORT = 8000;
+const int    CONTROL_PORT = 8001;
 
-const int LED_PIN_1 = A0; // Blinks slowly during connection
-const int LED_PIN_2 = A1; // Pulses once on successful connection
+const int LED_PIN_1 = A0;
+const int LED_PIN_2 = A1;
 
 const size_t MAX_PAYLOAD_SIZE = 50000;
-const size_t UDP_CHUNK_SIZE   = 1200; // Keep below 1400 MTU limit
+const size_t UDP_CHUNK_SIZE   = 1200;
 
 uint8_t payloadBuffer[MAX_PAYLOAD_SIZE];
+uint8_t chunkTxBuffer[UDP_CHUNK_SIZE + 4];
+
 IPAddress cachedServerIP(0, 0, 0, 0);
 
-// --- Dual Streaming Mode Control ---
-bool isContinuousMode = true; // Default: Continuous streaming when toggle is OFF
-bool frameRequested   = true; // Single-shot trigger when toggle is ON
+// --- Dual Streaming Mode & Motor Control State ---
+bool isContinuousMode = true;
+bool frameRequested    = true;
+float currentVal1      = 0.0f; // Left / Axis A (-1.0 to 1.0)
+float currentVal2      = 0.0f; // Right / Axis B (-1.0 to 1.0)
 
 // --- Diagnostics & Performance Metrics ---
 uint32_t totalFramesSent = 0;
@@ -41,14 +45,16 @@ uint32_t totalBytesSent  = 0;
 uint32_t camErrorCount   = 0;
 uint32_t udpErrorCount   = 0;
 
-// Windowed metrics for FPS / Throughput calculation
 uint32_t framesInWindow    = 0;
 uint32_t bytesInWindow     = 0;
 uint32_t lastStatsTime     = 0;
 uint32_t lastMdnsRetryTime = 0;
 bool     isWifiConnected   = false;
 
-// LED Blink Helper Function
+// Forward declaration
+void updateLampIndicators();
+void pollControlPacket();
+
 void pulseLED(int pin, uint32_t durationMs) {
   digitalWrite(pin, HIGH);
   delay(durationMs);
@@ -61,8 +67,6 @@ IPAddress resolveServerIP() {
   if (millis() - lastMdnsRetryTime < 2000) return cachedServerIP;
   lastMdnsRetryTime = millis();
 
-  Serial.printf("[mDNS] Resolving target host '%s'...\n", TARGET_HOST);
-
   IPAddress ip = MDNS.queryHost(TARGET_HOST);
   if (ip == IPAddress(0, 0, 0, 0)) {
     ip = MDNS.queryHost("larvtop.local");
@@ -70,9 +74,6 @@ IPAddress resolveServerIP() {
 
   if (ip != IPAddress(0, 0, 0, 0)) {
     cachedServerIP = ip;
-    Serial.printf("[mDNS SUCCESS] Resolved IP: %s\n", cachedServerIP.toString().c_str());
-  } else {
-    Serial.println("[mDNS WARN] Host resolution failed. Retrying...");
   }
   return cachedServerIP;
 }
@@ -80,11 +81,8 @@ IPAddress resolveServerIP() {
 int fetchFrameFromCamera(uint8_t* buffer, size_t maxLen) {
   uint32_t tStart = micros();
 
-  // Clear leftover garbage bytes in RX buffer
-  size_t flushedBytes = 0;
   while (Serial1.available()) {
     Serial1.read();
-    flushedBytes++;
   }
 
   Serial1.println("CAPTURE");
@@ -94,89 +92,70 @@ int fetchFrameFromCamera(uint8_t* buffer, size_t maxLen) {
 
   if (!header.startsWith("SIZE:")) {
     camErrorCount++;
-    Serial.printf("[CAM ERR] Corrupted header: '%s' (Flushed %u rx bytes)\n", header.c_str(), (unsigned int)flushedBytes);
     return -1;
   }
 
   int imgSize = header.substring(5).toInt();
   if (imgSize <= 0 || (size_t)imgSize > maxLen) {
     camErrorCount++;
-    Serial.printf("[CAM ERR] Invalid frame size: %d bytes (Max limit: %u)\n", imgSize, (unsigned int)maxLen);
     return -1;
   }
 
   size_t bytesRead = Serial1.readBytes((char*)buffer, imgSize);
-  uint32_t tElapsedUs = micros() - tStart;
-
   if (bytesRead != (size_t)imgSize) {
     camErrorCount++;
-    Serial.printf("[CAM ERR] UART Timeout! Received %u of %d bytes after %.2f ms\n",
-                  (unsigned int)bytesRead, imgSize, tElapsedUs / 1000.0);
     return -1;
   }
 
   return imgSize;
 }
 
-void setup() {
-  delay(1000);
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000);
+void pollControlPacket() {
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char packetBuffer[64];
+    int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+    packetBuffer[len] = '\0';
 
-  Serial.println("\n===========================================");
-  Serial.println("  ESP32 High-Speed UDP Streamer + Debug    ");
-  Serial.println("===========================================");
+    float v1 = 0.0f;
+    float v2 = 0.0f;
+    char modeChar = 'C';
 
-  Serial1.setRxBufferSize(16384);
-  Serial1.setTimeout(200);
-  Serial1.begin(1000000, SERIAL_8N1, D0, D1);
-  Serial.println("[HW] Camera UART initialized @ 1,000,000 baud.");
+    if (sscanf(packetBuffer, "%f,%f,%c", &v1, &v2, &modeChar) >= 2) {
+      currentVal1 = v1;
+      currentVal2 = v2;
 
-  pinMode(LED_PIN_1, OUTPUT);
-  pinMode(LED_PIN_2, OUTPUT);
-  digitalWrite(LED_PIN_1, LOW);
-  digitalWrite(LED_PIN_2, LOW);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  Serial.println("[WiFi] Disabled WiFi modem power-saving sleep.");
-
-  for (size_t i = 0; i < numNetworks; i++) {
-    wifiMulti.addAP(wifiNetworks[i].ssid, wifiNetworks[i].password);
-  }
-
-  Serial.print("[WiFi] Connecting");
-  uint32_t lastBlinkTime = 0;
-  bool blinkState = false;
-
-  while (wifiMulti.run() != WL_CONNECTED) {
-    if (millis() - lastBlinkTime >= 500) {
-      lastBlinkTime = millis();
-      blinkState = !blinkState;
-      digitalWrite(LED_PIN_1, blinkState ? HIGH : LOW);
-      Serial.print(".");
+      if (modeChar == 'I') {
+        isContinuousMode = false;
+      } else if (modeChar == 'C') {
+        isContinuousMode = true;
+      }
+      frameRequested = true;
+      updateLampIndicators(); // Instant reaction
     }
-    delay(20);
   }
+}
 
-  digitalWrite(LED_PIN_1, LOW);
-  pulseLED(LED_PIN_2, 200);
+void updateLampIndicators() {
+  bool isIdle = (currentVal1 == 0.0f && currentVal2 == 0.0f);
+  bool isReversing = (currentVal1 < 0.0f && currentVal2 < 0.0f);
 
-  isWifiConnected = true;
-  Serial.printf("\n[WiFi CONNECTED] SSID: %s | Local IP: %s | RSSI: %d dBm\n",
-                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
-
-  if (MDNS.begin("nano-esp32")) {
-    Serial.println("[mDNS] Local responder ready: nano-esp32.local");
+  if (isIdle) {
+    digitalWrite(LED_PIN_1, LOW);
+    digitalWrite(LED_PIN_2, LOW);
+  } else if (isReversing) {
+    static uint32_t lastRevBlink = 0;
+    static bool revBlinkState = false;
+    if (millis() - lastRevBlink >= 250) {
+      lastRevBlink = millis();
+      revBlinkState = !revBlinkState;
+    }
+    digitalWrite(LED_PIN_1, revBlinkState ? HIGH : LOW);
+    digitalWrite(LED_PIN_2, revBlinkState ? HIGH : LOW);
   } else {
-    Serial.println("[mDNS ERR] Responder initialization failed!");
+    digitalWrite(LED_PIN_1, currentVal1 > 0 ? HIGH : LOW);
+    digitalWrite(LED_PIN_2, currentVal2 > 0 ? HIGH : LOW);
   }
-
-  udp.begin(CONTROL_PORT);
-  Serial.printf("[UDP] Control socket listening on port %d\n", CONTROL_PORT);
-
-  lastStatsTime = millis();
 }
 
 void sendFrameUDP(IPAddress serverIP, int imgBytes) {
@@ -190,6 +169,10 @@ void sendFrameUDP(IPAddress serverIP, int imgBytes) {
   bool frameHadError = false;
 
   for (uint8_t chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+    // Poll for control packets between chunks for zero-lag input response
+    pollControlPacket();
+    updateLampIndicators();
+
     size_t offset = chunkIdx * UDP_CHUNK_SIZE;
     size_t bytesLeft = totalLen - offset;
     size_t chunkSize = (bytesLeft < UDP_CHUNK_SIZE) ? bytesLeft : UDP_CHUNK_SIZE;
@@ -197,21 +180,25 @@ void sendFrameUDP(IPAddress serverIP, int imgBytes) {
     if (!udp.beginPacket(serverIP, TARGET_PORT)) {
       udpErrorCount++;
       frameHadError = true;
-      continue;
+      break;
     }
 
-    uint8_t chunkHeader[4] = { frameId, chunkIdx, totalChunks, counter };
-    udp.write(chunkHeader, 4);
-    udp.write(payloadBuffer + offset, chunkSize);
+    chunkTxBuffer[0] = frameId;
+    chunkTxBuffer[1] = chunkIdx;
+    chunkTxBuffer[2] = totalChunks;
+    chunkTxBuffer[3] = counter;
+
+    memcpy(chunkTxBuffer + 4, payloadBuffer + offset, chunkSize);
+
+    udp.write(chunkTxBuffer, chunkSize + 4);
 
     if (!udp.endPacket()) {
       udpErrorCount++;
       frameHadError = true;
-      // Socket Recovery: Re-bind socket if transmission fails to prevent permanent lockup
-      udp.stop();
-      udp.begin(CONTROL_PORT);
       break;
     }
+
+    delayMicroseconds(150);
   }
 
   if (!frameHadError) {
@@ -233,15 +220,16 @@ void printRecurringStats() {
     float avgFrameKB = framesInWindow > 0 ? (bytesInWindow / 1024.0) / framesInWindow : 0.0;
 
     Serial.println("\n------------- [LIVE SYSTEM METRICS] -------------");
-    Serial.printf("  FPS:              %.1f frames/sec\n", fps);
-    Serial.printf("  Streaming Mode:  %s\n", isContinuousMode ? "CONTINUOUS" : "LOCKSTEP (ON-INPUT)");
-    Serial.printf("  Data Throughput: %.2f KB/s (%.2f Mbps)\n", kbps, (kbps * 8.0) / 1024.0);
-    Serial.printf("  Avg Frame Size:  %.1f KB\n", avgFrameKB);
-    Serial.printf("  Wi-Fi Status:    %s | RSSI: %d dBm | SSID: %s\n",
+    Serial.printf("  FPS:               %.1f frames/sec\n", fps);
+    Serial.printf("  Streaming Mode:    %s\n", isContinuousMode ? "CONTINUOUS" : "LOCKSTEP (ON-INPUT)");
+    Serial.printf("  Motor Cmd (Tanh):  %.1f, %.1f\n", currentVal1, currentVal2);
+    Serial.printf("  Data Throughput:   %.2f KB/s (%.2f Mbps)\n", kbps, (kbps * 8.0) / 1024.0);
+    Serial.printf("  Avg Frame Size:    %.1f KB\n", avgFrameKB);
+    Serial.printf("  Wi-Fi Status:      %s | RSSI: %d dBm | SSID: %s\n",
                   (WiFi.status() == WL_CONNECTED) ? "ONLINE" : "OFFLINE",
                   WiFi.RSSI(), WiFi.SSID().c_str());
-    Serial.printf("  Target Server:   %s:%d\n", cachedServerIP.toString().c_str(), TARGET_PORT);
-    Serial.printf("  Total Stats:     Sent: %u frames (%u KB) | Cam Errors: %u | UDP Errors: %u\n",
+    Serial.printf("  Target Server:     %s:%d\n", cachedServerIP.toString().c_str(), TARGET_PORT);
+    Serial.printf("  Total Stats:       Sent: %u frames (%u KB) | Cam Errors: %u | UDP Errors: %u\n",
                   totalFramesSent, totalBytesSent / 1024, camErrorCount, udpErrorCount);
     Serial.println("-------------------------------------------------");
 
@@ -251,64 +239,75 @@ void printRecurringStats() {
   }
 }
 
+void setup() {
+  delay(1000);
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+
+  Serial1.setRxBufferSize(16384);
+  Serial1.setTimeout(200);
+  Serial1.begin(1000000, SERIAL_8N1, D0, D1);
+
+  pinMode(LED_PIN_1, OUTPUT);
+  pinMode(LED_PIN_2, OUTPUT);
+  digitalWrite(LED_PIN_1, LOW);
+  digitalWrite(LED_PIN_2, LOW);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  for (size_t i = 0; i < numNetworks; i++) {
+    wifiMulti.addAP(wifiNetworks[i].ssid, wifiNetworks[i].password);
+  }
+
+  uint32_t lastBlinkTime = 0;
+  bool blinkState = false;
+
+  while (wifiMulti.run() != WL_CONNECTED) {
+    if (millis() - lastBlinkTime >= 500) {
+      lastBlinkTime = millis();
+      blinkState = !blinkState;
+      digitalWrite(LED_PIN_1, blinkState ? HIGH : LOW);
+    }
+    delay(20);
+  }
+
+  digitalWrite(LED_PIN_1, LOW);
+  pulseLED(LED_PIN_2, 200);
+
+  isWifiConnected = true;
+
+  MDNS.begin("nano-esp32");
+  udp.begin(CONTROL_PORT);
+
+  lastStatsTime = millis();
+}
+
 void loop() {
-  // 1. Wi-Fi Connection Guard
   if (wifiMulti.run() != WL_CONNECTED) {
     if (isWifiConnected) {
       isWifiConnected = false;
       cachedServerIP = IPAddress(0, 0, 0, 0);
-      Serial.println("\n[WiFi WARN] Connection dropped! Attempting auto-reconnect...");
     }
-
-    static uint32_t lastLoopBlink = 0;
-    static bool loopBlinkState = false;
-    if (millis() - lastLoopBlink >= 500) {
-      lastLoopBlink = millis();
-      loopBlinkState = !loopBlinkState;
-      digitalWrite(LED_PIN_1, loopBlinkState ? HIGH : LOW);
-    }
-
     delay(20);
     return;
   } else if (!isWifiConnected) {
     isWifiConnected = true;
     digitalWrite(LED_PIN_1, LOW);
     pulseLED(LED_PIN_2, 200);
-
-    Serial.printf("\n[WiFi RECONNECTED] SSID: %s | IP: %s | RSSI: %d dBm\n",
-                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
-
     frameRequested = true;
   }
 
-  // 2. Ensure target server IP is resolved
   IPAddress serverIP = resolveServerIP();
   if (serverIP == IPAddress(0, 0, 0, 0)) {
     delay(50);
     return;
   }
 
-  // 3. Listen for incoming control commands
-  int packetSize = udp.parsePacket();
-  if (packetSize >= 2) {
-    char led1 = udp.read();
-    char led2 = udp.read();
-    digitalWrite(LED_PIN_1, led1 == '1' ? HIGH : LOW);
-    digitalWrite(LED_PIN_2, led2 == '1' ? HIGH : LOW);
-
-    // Read mode byte: 'C' = Continuous, 'I' = Lockstep On-Input
-    if (packetSize >= 3) {
-      char modeChar = udp.read();
-      if (modeChar == 'I') {
-        isContinuousMode = false;
-      } else if (modeChar == 'C') {
-        isContinuousMode = true;
-      }
-    }
-
-    // Authorize next single-shot capture
-    frameRequested = true;
-  }
+  // 3. Poll control packets immediately at the start of loop
+  pollControlPacket();
+  updateLampIndicators();
 
   // 4. Send frame if continuously streaming OR if authorized by an input
   if (isContinuousMode || frameRequested) {
@@ -322,5 +321,6 @@ void loop() {
   // 5. Output periodic health metrics
   printRecurringStats();
 
+  updateLampIndicators();
   yield();
 }
