@@ -16,4 +16,23 @@ RectangleArena {
   translation -0.141708 0.092358 0
 }
 E-puck {
+  controller "rl_trainer"
+  supervisor TRUE
+}
+DEF GOAL Solid {
+  translation 0.108292 0.342358 0.025
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 0 0
+        roughness 1
+        metalness 0
+      }
+      geometry DEF GOAL_BOX Box {
+        size 0.05 0.05 0.05
+      }
+    }
+  ]
+  name "goal"
+  boundingObject USE GOAL_BOX
 }

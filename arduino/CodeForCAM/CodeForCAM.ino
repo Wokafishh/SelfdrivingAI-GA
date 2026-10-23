@@ -1,7 +1,7 @@
 #include "esp_camera.h"
 
-// Den inbyggda lilla röda lysdioden på ESP32-CAM (GPIO 33, låg = tänd)
 #define LED_BUILTIN_CAM 33
+#define FLASH_LED_PIN 4
 
 unsigned long lastCaptureTime = 0;
 
@@ -15,19 +15,22 @@ void warmupCamera(int frames) {
 
 void blinkStatus(int times, int delayMs) {
   for (int i = 0; i < times; i++) {
-    digitalWrite(LED_BUILTIN_CAM, LOW);  // Tänd
+    digitalWrite(LED_BUILTIN_CAM, LOW);
     delay(delayMs);
-    digitalWrite(LED_BUILTIN_CAM, HIGH); // Släck
+    digitalWrite(LED_BUILTIN_CAM, HIGH);
     delay(delayMs);
   }
 }
 
 void setup() {
-  // Höjd seriehastighet till 1 MHz för att hinna skicka bilder utan packet loss
+  // Locked to stable 1 Mbps
   Serial.begin(1000000);
 
   pinMode(LED_BUILTIN_CAM, OUTPUT);
-  digitalWrite(LED_BUILTIN_CAM, HIGH); // Släckt från start
+  digitalWrite(LED_BUILTIN_CAM, HIGH);
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -38,14 +41,14 @@ void setup() {
   config.pin_pclk = 22; config.pin_vsync = 25; config.pin_href = 23;
   config.pin_sscb_sda = 26; config.pin_sscb_scl = 27; config.pin_pwdn = 32;
   config.pin_reset = -1;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Optimerat för låg latens (320x240)
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;            // Låg komprimeringstid / lagom storlek
-  config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  // QQVGA (160x120) or FRAMESIZE_96X96. QQVGA is extremely stable for JPEGs and produces tiny ~2KB files.
+  config.frame_size = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -57,14 +60,12 @@ void setup() {
   if (s != NULL) {
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_wb_mode(s, 2); // Inomhus/Cloudy
+    s->set_wb_mode(s, 3);
     s->set_exposure_ctrl(s, 1);
     s->set_gain_ctrl(s, 1);
   }
 
   warmupCamera(5);
-
-  // Blinkar 3 gånger snabbt när allt är redo!
   blinkStatus(3, 100);
 }
 
@@ -74,7 +75,7 @@ void loop() {
     cmd.trim();
 
     if (cmd == "CAPTURE") {
-      digitalWrite(LED_BUILTIN_CAM, LOW); // Tänd LED under utläsning
+      digitalWrite(LED_BUILTIN_CAM, LOW);
 
       if (millis() - lastCaptureTime > 3000) {
         warmupCamera(2);
@@ -89,19 +90,20 @@ void loop() {
 
       lastCaptureTime = millis();
 
-      // Skicka bildstorlek
       Serial.printf("SIZE:%d\n", fb->len);
       Serial.flush();
 
-      // Skicka råa JPEG-bytes
       Serial.write(fb->buf, fb->len);
       Serial.flush();
 
       esp_camera_fb_return(fb);
-      digitalWrite(LED_BUILTIN_CAM, HIGH); // Släck LED
+      digitalWrite(LED_BUILTIN_CAM, HIGH);
     }
-    else if (cmd.length() > 0) {
-      Serial.printf("ERR:UNKNOWN_CMD_%s\n", cmd.c_str());
+    else if (cmd == "LIGHT_ON") {
+      digitalWrite(FLASH_LED_PIN, HIGH);
+    }
+    else if (cmd == "LIGHT_OFF") {
+      digitalWrite(FLASH_LED_PIN, LOW);
     }
   }
 }
