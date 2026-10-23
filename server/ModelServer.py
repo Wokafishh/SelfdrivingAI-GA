@@ -24,6 +24,10 @@ except ImportError:
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# Minimum AI output presets: 0 = off, 0.4 = lowest value that gets the motors moving, 1 = always full speed
+MIN_OUTPUT_PRESETS = (0.0, 0.4, 1.0)
+DEFAULT_MIN_OUTPUT = 0.4
+
 UDP_PORT = 8000
 CONTROL_PORT = 8001
 
@@ -48,6 +52,7 @@ class ESP32StreamerApp:
         self.better_controls_var = tk.BooleanVar(value=True)
         self.flashlight_var = tk.BooleanVar(value=False)
         self.input_only_var = tk.BooleanVar(value=False)
+        self.min_output_var = tk.DoubleVar(value=DEFAULT_MIN_OUTPUT)
 
         # PyTorch Model state & directory setup (targeting ../temp_models)
         self.model = None
@@ -171,6 +176,21 @@ class ESP32StreamerApp:
         )
         self.chk_input_mode.pack(anchor="w", pady=4)
 
+        # The recordings used smoothed controls, so models output small values
+        # (e.g. 0.1, -0.03) that are too weak to get the motors moving
+        self.lbl_min_output = ttk.Label(self.control_panel)
+        self.lbl_min_output.pack(anchor="w", pady=(8, 0))
+        self.scale_min_output = ttk.Scale(
+            self.control_panel,
+            from_=MIN_OUTPUT_PRESETS[0],
+            to=MIN_OUTPUT_PRESETS[-1],
+            orient="horizontal",
+            variable=self.min_output_var,
+            command=self._on_min_output_change
+        )
+        self.scale_min_output.pack(anchor="w", fill=tk.X, pady=(2, 4))
+        self._on_min_output_change()
+
         ttk.Separator(self.control_panel, orient="horizontal").pack(fill=tk.X, pady=10)
 
         # Active Command Display
@@ -262,6 +282,26 @@ class ESP32StreamerApp:
                 self.lbl_mode_status.config(text="Warning: AI Mode active, but no model loaded!", foreground="#c0392b")
             else:
                 self.lbl_mode_status.config(text="Current Mode: DrivingNetwork Inference", foreground="#8e44ad")
+
+    def _on_min_output_change(self, _value=None):
+        """Snaps the slider to the nearest preset and updates its label."""
+        value = self.min_output_var.get()
+        snapped = min(MIN_OUTPUT_PRESETS, key=lambda preset: abs(preset - value))
+        if snapped != value:
+            self.min_output_var.set(snapped)
+        text = "off" if snapped == 0 else f"faster wheel at least {snapped:g}"
+        self.lbl_min_output.config(text=f"Minimum AI output: {text}")
+
+    def _apply_min_output(self, cmd):
+        """Scales (left, right) up so the faster wheel is at least the slider's value, keeping the
+        ratio (and so the turn direction). Outputs that are already strong enough are left as they are."""
+        minimum = self.min_output_var.get()
+        left, right = cmd
+        strongest = max(abs(left), abs(right))
+        if minimum <= 0 or strongest < 1e-6 or strongest >= minimum:
+            return (left, right)
+        scale = minimum / strongest
+        return (left * scale, right * scale)
 
     def _load_model_inference(self, pil_img):
             """Passes the incoming PIL image through DrivingNetwork with robust diagnostics."""
@@ -483,6 +523,7 @@ class ESP32StreamerApp:
                 # If AI Model mode is active, run inference through DrivingNetwork
                 if not self.manual_control_var.get():
                     ai_cmd = self._load_model_inference(img)
+                    ai_cmd = self._apply_min_output(ai_cmd)
                     self.current_cmd = ai_cmd
                     self._update_command_visual(ai_cmd)
                     self._send_control_packet(ai_cmd)

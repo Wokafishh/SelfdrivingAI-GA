@@ -1,0 +1,5 @@
+# Computers without an NVIDIA GPU (e.g. the Linux laptop). Trains on the CPU.
+--extra-index-url https://download.pytorch.org/whl/cpu
+-r requirements.txt
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu

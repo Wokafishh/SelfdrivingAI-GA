@@ -1,0 +1,6 @@
+# Computers with an NVIDIA GPU (e.g. Windows + RTX 3060). CUDA 12.6 build,
+# needs an up-to-date NVIDIA driver (the CUDA toolkit itself is NOT needed).
+--extra-index-url https://download.pytorch.org/whl/cu126
+-r requirements.txt
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126

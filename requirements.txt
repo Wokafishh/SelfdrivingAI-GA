@@ -1,0 +1,5 @@
+# Packages shared by every computer. Don't install this file on its own:
+# use requirements-cpu.txt or requirements-cuda.txt, they include it plus the right torch build.
+pillow==12.3.0
+numpy==2.5.2
+pynput==1.8.2

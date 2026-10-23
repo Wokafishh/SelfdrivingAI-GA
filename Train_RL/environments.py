@@ -26,7 +26,7 @@ TIME_PENALTY = 0.002      # Small cost per step, so dawdling isn't free
 GOAL_RADIUS = 0.08          # Center-to-center distance that counts as "reached"
 MAX_EPISODE_STEPS = 300
 
-# --- Robot (roughly an e-puck, matches the Webots world) ---
+# --- Robot for SimulatedCubeEnv (a small e-puck sized stand-in, the Webots car is in webots_env.py) ---
 MAX_STEP_DISTANCE = 0.0165  # Meters driven per step at full speed
 AXLE_WIDTH = 0.052
 ROBOT_RADIUS = 0.037

@@ -1,0 +1,2 @@
+session,iteration,session_iteration,iteration_seconds,session_seconds,total_training_seconds,loss,val_loss
+1,1,1,48.492,48.492,48.492,0.180498,0.167736

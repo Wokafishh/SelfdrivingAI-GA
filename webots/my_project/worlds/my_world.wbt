@@ -1,38 +1,447 @@
 #VRML_SIM R2025a utf8
+# Arena for RL training: 2.78 x 2.78 m floor, 0.68 m walls, 10 obstacles and a red goal cube.
+# Car, goal and obstacles are re-randomized by the rl_trainer controller (Train_RL/webots_env.py)
+# on every episode reset, so the positions below are only the starting layout.
+# Arena center is the world origin. Texture/mesh paths are relative to this file.
 
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/floors/protos/RectangleArena.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
 
 WorldInfo {
+  info [
+    "Self-driving car RL arena"
+  ]
+  basicTimeStep 16
+  contactProperties [
+    ContactProperties {
+      material2 "caster"
+      coulombFriction [
+        0
+      ]
+    }
+  ]
 }
 Viewpoint {
-  orientation 0.16772541644595929 -0.5385365543374596 -0.8257400101244737 5.561819995263236
-  position -0.2013600730337919 -0.15743854223887657 0.15189655227557985
+  orientation 0 1 0 0.9
+  position -2.6 0 3.2
 }
 TexturedBackground {
+  texture "empty_office"
 }
-RectangleArena {
-  translation -0.141708 0.092358 0
+TexturedBackgroundLight {
+  texture "empty_office"
 }
-E-puck {
-  controller "rl_trainer"
-  supervisor TRUE
-}
-DEF GOAL Solid {
-  translation 0.108292 0.342358 0.025
+DEF FLOOR Solid {
+  translation 0 0 -0.01
   children [
     Shape {
       appearance PBRAppearance {
-        baseColor 1 0 0
-        roughness 1
+        baseColorMap ImageTexture {
+          url [
+            "../../../Train_RL/textures/floor.jpg"
+          ]
+        }
+        roughness 0.8
+        metalness 0
+        textureTransform TextureTransform {
+          scale 4 7
+        }
+      }
+      geometry DEF FLOOR_BOX Box {
+        size 2.82 2.82 0.02
+      }
+    }
+  ]
+  name "floor"
+  boundingObject USE FLOOR_BOX
+  locked TRUE
+}
+DEF WALL_NORTH Solid {
+  translation 0 1.4 0.34
+  children [
+    DEF WALL_X Shape {
+      appearance DEF WALL_APPEARANCE PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../../../Train_RL/textures/walls.jpg"
+          ]
+        }
+        roughness 0.9
+        metalness 0
+        textureTransform TextureTransform {
+          scale 4 1.7
+        }
+      }
+      geometry DEF WALL_X_BOX Box {
+        size 2.82 0.02 0.68
+      }
+    }
+  ]
+  name "wall north"
+  boundingObject USE WALL_X_BOX
+  locked TRUE
+}
+DEF WALL_SOUTH Solid {
+  translation 0 -1.4 0.34
+  children [
+    USE WALL_X
+  ]
+  name "wall south"
+  boundingObject USE WALL_X_BOX
+  locked TRUE
+}
+DEF WALL_EAST Solid {
+  translation 1.4 0 0.34
+  children [
+    DEF WALL_Y Shape {
+      appearance USE WALL_APPEARANCE
+      geometry DEF WALL_Y_BOX Box {
+        size 0.02 2.82 0.68
+      }
+    }
+  ]
+  name "wall east"
+  boundingObject USE WALL_Y_BOX
+  locked TRUE
+}
+DEF WALL_WEST Solid {
+  translation -1.4 0 0.34
+  children [
+    USE WALL_Y
+  ]
+  name "wall west"
+  boundingObject USE WALL_Y_BOX
+  locked TRUE
+}
+DEF GOAL Solid {
+  translation 0 1.1 0.04
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.05 0.05
+        roughness 0.7
         metalness 0
       }
       geometry DEF GOAL_BOX Box {
-        size 0.05 0.05 0.05
+        size 0.06 0.06 0.08
       }
     }
   ]
   name "goal"
   boundingObject USE GOAL_BOX
+}
+DEF OBSTACLE_0 Solid {
+  translation -0.9 -0.9 0.125
+  rotation 0 0 1 0.3
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.85 0.82
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_0_BOX Box {
+        size 0.15 0.15 0.25
+      }
+    }
+  ]
+  name "obstacle 0"
+  boundingObject USE OBSTACLE_0_BOX
+}
+DEF OBSTACLE_1 Solid {
+  translation 0.05 -1.0 0.110
+  rotation 0 0 1 1.1
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.55 0.42 0.28
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_1_BOX Box {
+        size 0.13 0.13 0.22
+      }
+    }
+  ]
+  name "obstacle 1"
+  boundingObject USE OBSTACLE_1_BOX
+}
+DEF OBSTACLE_2 Solid {
+  translation 0.9 -0.85 0.140
+  rotation 0 0 1 0.0
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.3 0.32 0.35
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_2_BOX Box {
+        size 0.17 0.17 0.28
+      }
+    }
+  ]
+  name "obstacle 2"
+  boundingObject USE OBSTACLE_2_BOX
+}
+DEF OBSTACLE_3 Solid {
+  translation -0.6 -0.2 0.130
+  rotation 0 0 1 0.7
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.85 0.82
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_3_BOX Box {
+        size 0.14 0.14 0.26
+      }
+    }
+  ]
+  name "obstacle 3"
+  boundingObject USE OBSTACLE_3_BOX
+}
+DEF OBSTACLE_4 Solid {
+  translation 0.45 -0.25 0.120
+  rotation 0 0 1 2.0
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.2 0.35 0.6
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_4_BOX Box {
+        size 0.16 0.16 0.24
+      }
+    }
+  ]
+  name "obstacle 4"
+  boundingObject USE OBSTACLE_4_BOX
+}
+DEF OBSTACLE_5 Solid {
+  translation 1.0 0.25 0.100
+  rotation 0 0 1 0.4
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.55 0.42 0.28
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_5_BOX Box {
+        size 0.12 0.12 0.2
+      }
+    }
+  ]
+  name "obstacle 5"
+  boundingObject USE OBSTACLE_5_BOX
+}
+DEF OBSTACLE_6 Solid {
+  translation -1.0 0.5 0.150
+  rotation 0 0 1 1.4
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.3 0.32 0.35
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_6_BOX Box {
+        size 0.18 0.18 0.3
+      }
+    }
+  ]
+  name "obstacle 6"
+  boundingObject USE OBSTACLE_6_BOX
+}
+DEF OBSTACLE_7 Solid {
+  translation -0.2 0.55 0.125
+  rotation 0 0 1 0.9
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.85 0.82
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_7_BOX Box {
+        size 0.15 0.15 0.25
+      }
+    }
+  ]
+  name "obstacle 7"
+  boundingObject USE OBSTACLE_7_BOX
+}
+DEF OBSTACLE_8 Solid {
+  translation 0.6 0.8 0.115
+  rotation 0 0 1 2.6
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.55 0.42 0.28
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_8_BOX Box {
+        size 0.14 0.14 0.23
+      }
+    }
+  ]
+  name "obstacle 8"
+  boundingObject USE OBSTACLE_8_BOX
+}
+DEF OBSTACLE_9 Solid {
+  translation -0.55 1.05 0.135
+  rotation 0 0 1 0.2
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.2 0.35 0.6
+        roughness 1
+        metalness 0
+      }
+      geometry DEF OBSTACLE_9_BOX Box {
+        size 0.16 0.16 0.27
+      }
+    }
+  ]
+  name "obstacle 9"
+  boundingObject USE OBSTACLE_9_BOX
+}
+DEF CAR Robot {
+  translation 0.1 -0.55 0
+  rotation -0.043108 0.043108 0.99814 1.572662
+  children [
+    CadShape {
+      url [
+        "../../../Train_RL/models/webots/car_body.obj"
+      ]
+    }
+    # ESP32-CAM lens: 2 cm under the top of the mast, 1 cm in front of it. Fixed to the body,
+    # so it points slightly down like the real car (the caster is ~1 cm shorter than the wheels)
+    Camera {
+      translation 0.11 0 0.127
+      name "camera"
+      fieldOfView 1.0
+      width 64
+      height 64
+      near 0.01
+      noise 0.02
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 0.067 0.0325
+      }
+      device [
+        RotationalMotor {
+          name "left wheel motor"
+          maxVelocity 15
+          maxTorque 0.1
+        }
+      ]
+      endPoint Solid {
+        translation 0 0.067 0.0325
+        children [
+          CadShape {
+            url [
+              "../../../Train_RL/models/webots/car_wheel_left.obj"
+            ]
+          }
+        ]
+        name "left wheel"
+        boundingObject DEF WHEEL_BOUNDS Pose {
+          rotation 1 0 0 1.5708
+          children [
+            Cylinder {
+              height 0.026
+              radius 0.0325
+            }
+          ]
+        }
+        physics DEF WHEEL_PHYSICS Physics {
+          density -1
+          mass 0.03
+        }
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 -0.067 0.0325
+      }
+      device [
+        RotationalMotor {
+          name "right wheel motor"
+          maxVelocity 15
+          maxTorque 0.1
+        }
+      ]
+      endPoint Solid {
+        translation 0 -0.067 0.0325
+        children [
+          CadShape {
+            url [
+              "../../../Train_RL/models/webots/car_wheel_right.obj"
+            ]
+          }
+        ]
+        name "right wheel"
+        boundingObject USE WHEEL_BOUNDS
+        physics USE WHEEL_PHYSICS
+      }
+    }
+    Solid {
+      translation 0.104 0 0.018
+      name "caster"
+      contactMaterial "caster"
+      boundingObject Sphere {
+        radius 0.009
+      }
+      physics Physics {
+        density -1
+        mass 0.005
+      }
+    }
+  ]
+  name "rl_car"
+  boundingObject Group {
+    children [
+      Pose {
+        translation 0.056 0 0.0385
+        children [
+          Box {
+            size 0.19 0.1 0.033
+          }
+        ]
+      }
+      Pose {
+        translation 0.0925 0 0.0455
+        children [
+          Box {
+            size 0.117 0.164 0.01
+          }
+        ]
+      }
+      Pose {
+        translation 0.09 0 0.097
+        children [
+          Box {
+            size 0.02 0.04 0.1
+          }
+        ]
+      }
+    ]
+  }
+  physics Physics {
+    density -1
+    mass 0.4
+    centerOfMass [
+      0.03 0 0.04
+    ]
+  }
+  controller "rl_trainer"
+  supervisor TRUE
 }

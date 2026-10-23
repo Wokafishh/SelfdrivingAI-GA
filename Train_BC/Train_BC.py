@@ -10,24 +10,28 @@ from pathlib import Path
 
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from arkitektur import DrivingNetwork
 from training_common import (
     DrivingDataset,
     action_loss,
+    augment_labeled_batch,
+    batch_indices,
     evaluate_loss,
     print_batch_diagnostics,
     print_mean_baseline,
     split_files_by_recording,
+    to_cpu,
+    to_float_images,
 )
 
 BATCH_SIZE = 64
 
 
-def setup(lr: float = 1e-3, data_files=None):
+def setup(lr: float = 1e-3, data_files=None, device="cpu"):
     torch.manual_seed(42)
+    device = torch.device(device)
 
     if not data_files:
         raise ValueError("[BC Training Error] No data files were passed! Check your ./data directory.")
@@ -37,77 +41,97 @@ def setup(lr: float = 1e-3, data_files=None):
     for path in val_files:
         print(f"  * validation: {Path(path).name}")
 
-    train_set = DrivingDataset(train_files, filter_zeros=True, augment=True, name="Train")
+    train_set = DrivingDataset(train_files, filter_zeros=True, name="Train")
     if len(train_set) == 0:
         raise ValueError("[BC Training Error] Training set is empty after filtering zeros!")
 
-    val_set = DrivingDataset(val_files, filter_zeros=True, augment=False, name="Validation") if val_files else None
+    val_set = DrivingDataset(val_files, filter_zeros=True, name="Validation") if val_files else None
     if val_set is not None and len(val_set) == 0:
         val_set = None
     if val_set is None:
         print("[Split WARNING] No validation data. Overfitting can't be detected.")
 
-    train_loader = DataLoader(train_set, batch_size=min(BATCH_SIZE, len(train_set)), shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=256) if val_set is not None else None
-
     model = DrivingNetwork(in_channels=3)
-    model.train()
-
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.HuberLoss(delta=1.0)
 
     if val_set is not None:
         print_mean_baseline(criterion, train_set.actions, val_set.actions)
 
+    # All frames live on the training device; batches are augmented there
+    model.to(device)
+    train_set.to(device)
+    if val_set is not None:
+        val_set.to(device)
+    model.train()
+    batch_size = min(BATCH_SIZE, len(train_set))
+    batches_per_epoch = -(-len(train_set) // batch_size)
+
     # --- DIAGNOSTIC SANITY CHECK ---
     print("\n[DIAGNOSTIC] Running model forward-pass sanity check...")
     try:
-        test_batch, test_l, test_r = next(iter(train_loader))
+        sample_images = to_float_images(train_set.images[:2])
+        sample_actions = train_set.actions[:2]
         model.eval()
         with torch.no_grad():
-            p_l, p_r = model(test_batch[:2])
+            p_l, p_r = model(sample_images)
         model.train()
-        for i in range(min(2, len(test_batch))):
-            print(f"  * Test Sample {i + 1} -> Pred: [{p_l[i].item():+.2f}, {p_r[i].item():+.2f}] | Target: [{test_l[i].item():+.2f}, {test_r[i].item():+.2f}]")
+        for i in range(len(sample_actions)):
+            print(f"  * Test Sample {i + 1} -> Pred: [{p_l[i].item():+.2f}, {p_r[i].item():+.2f}] | Target: [{sample_actions[i, 0].item():+.2f}, {sample_actions[i, 1].item():+.2f}]")
     except Exception as e:
         print(f"[DIAGNOSTIC WARNING] Sanity check encountered an issue: {e}")
     print("[DIAGNOSTIC] Sanity check complete.\n")
 
     best_val_loss = float("inf")
 
-    def train_step(epoch: int) -> float:
-        """Runs one full pass over the training data and returns the mean train loss."""
+    def train_step(epoch: int) -> dict:
+        """Runs one full pass over the training data and returns its metrics."""
         nonlocal best_val_loss
         model.train()
-        total_loss, total_samples = 0.0, 0
+        total_loss = torch.zeros((), device=device)
 
-        for batch_idx, (images, expert_left, expert_right) in enumerate(train_loader, start=1):
+        for batch_idx, idx in enumerate(batch_indices(len(train_set), batch_size, device), start=1):
+            images, actions = augment_labeled_batch(to_float_images(train_set.images[idx]), train_set.actions[idx])
+
             optimizer.zero_grad()
-            loss, pred_left, pred_right = action_loss(model, criterion, images, expert_left, expert_right)
+            loss, pred_left, pred_right = action_loss(model, criterion, images, actions)
             loss.backward()
 
             # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            total_loss += loss.item() * len(images)
-            total_samples += len(images)
+            # Summed on the device; calling .item() every batch would stall the GPU
+            total_loss += loss.detach() * len(idx)
 
             # Print detailed diagnostics every 50 batches
             if batch_idx % 50 == 0:
-                print_batch_diagnostics(batch_idx, len(train_loader), loss.item(), pred_left[0], pred_right[0], expert_left[0], expert_right[0])
+                print_batch_diagnostics(batch_idx, batches_per_epoch, loss.item(), pred_left[0], pred_right[0], actions[0, 0], actions[0, 1])
 
-        train_loss = total_loss / total_samples
+        train_loss = total_loss.item() / len(train_set)
         message = f"[EPOCH {epoch}] Train loss: {train_loss:.5f}"
 
-        if val_loader is not None:
-            val_loss = evaluate_loss(model, criterion, val_loader)
+        val_loss = None
+        if val_set is not None:
+            val_loss = evaluate_loss(model, criterion, val_set)
             message += f" | Val loss: {val_loss:.5f}"
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 message += "  (best so far)"
 
         print(message)
-        return train_loss
+        return {"loss": train_loss, "val_loss": val_loss}
+
+    # Saved/restored by run_training.py so resumed sessions continue seamlessly
+    def get_state() -> dict:
+        return {"optimizer": to_cpu(optimizer.state_dict()), "best_val_loss": best_val_loss}
+
+    def set_state(state: dict) -> None:
+        nonlocal best_val_loss
+        optimizer.load_state_dict(state["optimizer"])
+        best_val_loss = state.get("best_val_loss", float("inf"))
+
+    train_step.get_state = get_state
+    train_step.set_state = set_state
 
     return model, train_step, "Behaviour Cloning (BC)"

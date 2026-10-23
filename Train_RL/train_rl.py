@@ -31,6 +31,7 @@ sys.path.append(str(ROOT_DIR))
 sys.path.append(str(Path(__file__).resolve().parent))
 from arkitektur import DrivingNetwork
 from environments import SimulatedCubeEnv
+from training_common import to_cpu
 
 # Optionally start the actor from a BC/SemiSL model instead of random weights,
 # e.g. ROOT_DIR / "temp_models" / "bc19.pt". Skips a lot of random exploration.
@@ -82,9 +83,13 @@ class ActorCritic(nn.Module):
         return self.critic(states).squeeze(1)
 
 
-def setup(lr: float = 3e-4, data_files=None, env=None):
-    """data_files is unused (RL makes its own data). env defaults to SimulatedCubeEnv."""
+def setup(lr: float = 3e-4, data_files=None, env=None, device="cpu"):
+    """data_files is unused (RL makes its own data). env defaults to SimulatedCubeEnv.
+
+    The networks run on `device`; the environment always gets and returns CPU values.
+    """
     torch.manual_seed(42)
+    device = torch.device(device)
     env = env if env is not None else SimulatedCubeEnv(seed=42)
 
     policy = ActorCritic()
@@ -92,6 +97,7 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
         with open(INIT_WEIGHTS, "rb") as f:
             policy.actor.load_state_dict(pickle.load(f))
         print(f"[RL] Actor initialised from '{INIT_WEIGHTS}'.")
+    policy.to(device)
     policy.train()
 
     optimizer = optim.Adam(policy.parameters(), lr=lr)
@@ -107,10 +113,12 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
 
         for _ in range(ROLLOUT_STEPS):
             with torch.no_grad():
-                dist = policy.distribution(state.unsqueeze(0))
+                state_batch = state.unsqueeze(0).to(device)
+                dist = policy.distribution(state_batch)
                 action = dist.sample()[0]
                 log_prob = dist.log_prob(action).sum()
-                value = policy.value(state.unsqueeze(0))[0]
+                value = policy.value(state_batch)[0]
+            action, log_prob, value = action.cpu(), log_prob.cpu(), value.cpu()
 
             next_state, reward, done, info = env.step(action.clamp(-1.0, 1.0).tolist())
 
@@ -131,10 +139,10 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
                 state = next_state
 
         with torch.no_grad():
-            last_value = policy.value(state.unsqueeze(0))[0]
+            last_value = policy.value(state.unsqueeze(0).to(device))[0].cpu()
 
         # Generalized Advantage Estimation: how much better each action was than the critic expected
-        # (timeouts are treated like real episode ends, a simplification)
+        # (timeouts are treated like real episode ends, a simplification; computed on the CPU)
         values_t = torch.stack(values)
         rewards_t = torch.tensor(rewards)
         dones_t = torch.tensor(dones)
@@ -154,6 +162,7 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
             "advantages": advantages,
             "returns": advantages + values_t,
         }
+        batch = {key: value.to(device) for key, value in batch.items()}
         return batch, finished, rewards_t
 
     def ppo_update(batch) -> float:
@@ -162,7 +171,7 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
         total_loss, updates = 0.0, 0
 
         for _ in range(PPO_EPOCHS):
-            for idx in torch.randperm(ROLLOUT_STEPS).split(MINIBATCH_SIZE):
+            for idx in torch.randperm(ROLLOUT_STEPS, device=device).split(MINIBATCH_SIZE):
                 dist = policy.distribution(batch["states"][idx])
                 log_prob = dist.log_prob(batch["actions"][idx]).sum(dim=1)
                 entropy = dist.entropy().sum(dim=1).mean()
@@ -186,21 +195,45 @@ def setup(lr: float = 3e-4, data_files=None, env=None):
 
         return total_loss / updates
 
-    def train_step(iteration: int) -> float:
+    def train_step(iteration: int) -> dict:
         batch, finished, rewards = collect_rollout()
         loss = ppo_update(batch)
 
-        message = f"[ITERATION {iteration}] PPO loss: {loss:.4f} | Reward/step: {rewards.mean():+.4f}"
+        metrics = {
+            "loss": loss,
+            "reward_per_step": rewards.mean().item(),
+            "episodes": len(finished),
+            "mean_return": None,
+            "mean_episode_length": None,
+            "reached_rate": None,
+            "mean_steps_to_goal": None,
+            "action_std": policy.log_std.exp().mean().item(),
+        }
+
+        message = f"[ITERATION {iteration}] PPO loss: {loss:.4f} | Reward/step: {metrics['reward_per_step']:+.4f}"
         if finished:
-            mean_return = sum(f[0] for f in finished) / len(finished)
-            mean_length = sum(f[1] for f in finished) / len(finished)
-            success = sum(f[2] for f in finished) / len(finished)
+            metrics["mean_return"] = sum(f[0] for f in finished) / len(finished)
+            metrics["mean_episode_length"] = sum(f[1] for f in finished) / len(finished)
+            metrics["reached_rate"] = sum(f[2] for f in finished) / len(finished)
+            goal_lengths = [f[1] for f in finished if f[2]]
+            if goal_lengths:
+                metrics["mean_steps_to_goal"] = sum(goal_lengths) / len(goal_lengths)
             message += (
-                f" | Episodes: {len(finished)}, mean return {mean_return:+.3f}, "
-                f"mean length {mean_length:.0f}, reached cube {success:.0%}"
+                f" | Episodes: {len(finished)}, mean return {metrics['mean_return']:+.3f}, "
+                f"mean length {metrics['mean_episode_length']:.0f}, reached cube {metrics['reached_rate']:.0%}"
             )
-        message += f" | Action std: {policy.log_std.exp().mean():.3f}"
+        message += f" | Action std: {metrics['action_std']:.3f}"
         print(message)
-        return loss
+        return metrics
+
+    # Saved/restored by run_training.py so resumed sessions continue seamlessly
+    def get_state() -> dict:
+        return {"optimizer": to_cpu(optimizer.state_dict())}
+
+    def set_state(state: dict) -> None:
+        optimizer.load_state_dict(state["optimizer"])
+
+    train_step.get_state = get_state
+    train_step.set_state = set_state
 
     return policy, train_step, "Deep Reinforcement Learning (PPO)"

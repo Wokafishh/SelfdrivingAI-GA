@@ -1,0 +1,2 @@
+session,started_at,method,stopped_by,time_limit_minutes,iterations_this_session,first_iteration,last_iteration,total_iterations,session_training_seconds,session_wall_seconds,total_training_seconds,start_loss,final_loss,snapshot,final_val_loss
+1,2026-10-23T10:15:51,Behaviour Cloning (BC),time_limit,1.0,1,1,1,1,48.492,60.001,48.492,0.180498,0.180498,temp_models/bc19_session1.pt,0.167736

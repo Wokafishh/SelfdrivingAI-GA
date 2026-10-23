@@ -1,11 +1,65 @@
 # SelfdrivingAI-GA
 Python code for self driving models. Three different models will be trained with different algorithmns.
 
-.venv innehåller BARA modules för CPU-träning!
-
 Använder:
 - PyTorch
 - Webots (endast för RL-träningen)
+
+## Setup (.venv)
+`.venv` is not in git and can't be copied between Linux and Windows, so build it on each computer.
+
+Linux / no NVIDIA GPU (CPU training):
+```
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements-cpu.txt
+```
+
+Windows + NVIDIA GPU (e.g. RTX 3060, CUDA training). Needs an up-to-date NVIDIA driver:
+```
+py -3.14 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements-cuda.txt
+.venv\Scripts\python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+The last line should print `True` and the GPU name.
+
+## Training
+`python run_training.py` asks for everything, including the device (cpu/cuda).
+Or pass it all at once, e.g. a 5 minute session on the GPU (run again to resume):
+```
+python run_training.py --method bc --minutes 5 --data a --name bc_final --device cuda
+```
+Models are always saved as CPU tensors, so a model trained on the GPU works in `server/ModelServer.py` on any computer.
+
+`--method rl` in `run_training.py` only trains in `SimulatedCubeEnv`, a simple 2D stand-in for testing the PPO code. Real RL training runs inside Webots, see below.
+
+## RL training in Webots (Windows + NVIDIA GPU)
+The arena is `webots/my_project/worlds/my_world.wbt`: 2.78 x 2.78 m floor, 0.68 m walls, 10 obstacles and a red 6x6x8 cm goal cube.
+Our car (meshes in `Train_RL/models/webots`) has a 64x64 camera as its only sensor. Every episode the car, goal and
+obstacles are placed randomly (`Train_RL/webots_env.py`). The training loop is `webots/my_project/controllers/rl_trainer/rl_trainer.py`.
+
+1. Install Webots R2025a and build the `.venv` with `requirements-cuda.txt` (see Setup).
+2. In Webots: Tools > Preferences > Python command -> the full path to `<project>\.venv\Scripts\python.exe`
+   (otherwise the controller can't import torch).
+3. Open `webots/my_project/worlds/my_world.wbt` and press fast mode (>>). Training starts on its own and uses
+   the GPU if one is found (`DEVICE = "auto"`).
+4. A session stops after `TIME_LIMIT_MINUTES` (5 by default) and saves `temp_models/rl_final.pt` plus a
+   `_session<N>` snapshot. Reload the world (or reset the simulation) to run another session; it resumes from the last one.
+   Logs go to `training_logs/rl_final_*.csv`.
+
+Session length and model name can also be set without editing code, with the `RL_MINUTES` and `RL_MODEL_NAME`
+environment variables. Set them in the same terminal before starting Webots:
+```
+set RL_MINUTES=120
+"C:\Program Files\Webots\msys64\mingw64\bin\webots.exe" webots\my_project\worlds\my_world.wbt
+```
+Headless on Linux: `PATH="$PWD/.venv/bin:$PATH" RL_MINUTES=120 webots --batch --mode=fast --no-rendering webots/my_project/worlds/my_world.wbt`
+
+Tips:
+- Learning from scratch is slow (one PPO iteration is ~1 minute). Starting from a BC model helps a lot: set `INIT_WEIGHTS`
+  in `Train_RL/train_rl.py` to e.g. `ROOT_DIR / "temp_models" / "bc20.pt"`. `.pt` files are not in git, so copy that file over by hand.
+- Car settings in the world file that are estimates and should match the real car: wheel `maxVelocity` (also
+  `MAX_WHEEL_SPEED` in `webots_env.py`), camera `fieldOfView` and the camera position/angle.
+- If the Inventor model changes, re-export it to `Train_RL/models` and run `python Train_RL/models/convert_car_model.py`.
 
 
 ### Behaviour cloning/Imitation Learning

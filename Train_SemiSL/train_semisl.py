@@ -21,7 +21,6 @@ from pathlib import Path
 
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
@@ -30,11 +29,16 @@ from training_common import (
     DrivingDataset,
     UnlabeledDataset,
     action_loss,
+    augment_labeled_batch,
+    endless_batch_indices,
     evaluate_loss,
     hash_bucket,
+    noisy_images,
     print_batch_diagnostics,
     print_mean_baseline,
     split_files_by_recording,
+    to_cpu,
+    to_float_images,
 )
 
 # Share of training recordings whose actions are used as labels. The rest are
@@ -70,15 +74,9 @@ def ema_update(teacher: nn.Module, student: nn.Module, decay: float) -> None:
         t_buf.copy_(s_buf)
 
 
-def cycle(loader):
-    """Iterates a DataLoader forever, reshuffling each pass."""
-    while True:
-        for batch in loader:
-            yield batch
-
-
-def setup(lr: float = 1e-3, data_files=None):
+def setup(lr: float = 1e-3, data_files=None, device="cpu"):
     torch.manual_seed(42)
+    device = torch.device(device)
 
     if not data_files:
         raise ValueError("[SemiSL Training Error] No data files were passed! Check your ./data directory.")
@@ -95,24 +93,16 @@ def setup(lr: float = 1e-3, data_files=None):
           f"All {len(train_files)} training recordings + {len(extra_unlabeled)} extra unlabeled "
           f"recordings feed the unlabeled stream.")
 
-    labeled_set = DrivingDataset(labeled_files, filter_zeros=True, augment=True, name="Labeled")
+    labeled_set = DrivingDataset(labeled_files, filter_zeros=True, name="Labeled")
     if len(labeled_set) == 0:
         raise ValueError("[SemiSL Training Error] Labeled set is empty after filtering zeros!")
     unlabeled_set = UnlabeledDataset(train_files + extra_unlabeled, name="Unlabeled")
 
-    val_set = DrivingDataset(val_files, filter_zeros=True, augment=False, name="Validation") if val_files else None
+    val_set = DrivingDataset(val_files, filter_zeros=True, name="Validation") if val_files else None
     if val_set is not None and len(val_set) == 0:
         val_set = None
     if val_set is None:
         print("[Split WARNING] No validation data. Overfitting can't be detected.")
-
-    labeled_loader = DataLoader(labeled_set, batch_size=min(LABELED_BATCH_SIZE, len(labeled_set)), shuffle=True)
-    unlabeled_loader = DataLoader(unlabeled_set, batch_size=min(UNLABELED_BATCH_SIZE, len(unlabeled_set)), shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=256) if val_set is not None else None
-
-    labeled_iter = cycle(labeled_loader)
-    unlabeled_iter = cycle(unlabeled_loader)
-    steps_per_epoch = max(len(labeled_loader), len(unlabeled_loader))
 
     student = DrivingNetwork(in_channels=3)
     teacher = copy.deepcopy(student)
@@ -125,14 +115,29 @@ def setup(lr: float = 1e-3, data_files=None):
 
     if val_set is not None:
         print_mean_baseline(supervised_criterion, labeled_set.actions, val_set.actions)
+
+    # All frames live on the training device; batches are augmented there
+    student.to(device)
+    teacher.to(device)
+    labeled_set.to(device)
+    unlabeled_set.to(device)
+    if val_set is not None:
+        val_set.to(device)
+
+    labeled_batch = min(LABELED_BATCH_SIZE, len(labeled_set))
+    unlabeled_batch = min(UNLABELED_BATCH_SIZE, len(unlabeled_set))
+    labeled_iter = endless_batch_indices(len(labeled_set), labeled_batch, device)
+    unlabeled_iter = endless_batch_indices(len(unlabeled_set), unlabeled_batch, device)
+    steps_per_epoch = max(-(-len(labeled_set) // labeled_batch), -(-len(unlabeled_set) // unlabeled_batch))
+
     print(f"\n[SemiSL] {steps_per_epoch} steps per epoch | EMA decay {EMA_DECAY} | "
           f"consistency weight up to {CONSISTENCY_WEIGHT} over {CONSISTENCY_RAMPUP_EPOCHS} epochs\n")
 
     best_val_loss = float("inf")
     first_step = True
 
-    def train_step(epoch: int) -> float:
-        """One epoch of mixed labeled/unlabeled steps. Returns the mean supervised loss
+    def train_step(epoch: int) -> dict:
+        """One epoch of mixed labeled/unlabeled steps. "loss" is the mean supervised loss
         (comparable with BC; the total loss grows while the consistency weight ramps up)."""
         nonlocal best_val_loss, first_step
 
@@ -145,16 +150,21 @@ def setup(lr: float = 1e-3, data_files=None):
         student.train()
         teacher.eval()
         weight = consistency_weight(epoch - 1)
-        totals = {"loss": 0.0, "supervised": 0.0, "consistency": 0.0}
+        # Summed on the device; calling .item() every step would stall the GPU
+        totals = torch.zeros(3, device=device)  # total, supervised, consistency
 
         for step in range(1, steps_per_epoch + 1):
-            images, expert_left, expert_right = next(labeled_iter)
-            clean, noisy = next(unlabeled_iter)
+            labeled_idx = next(labeled_iter)
+            images, actions = augment_labeled_batch(
+                to_float_images(labeled_set.images[labeled_idx]), labeled_set.actions[labeled_idx]
+            )
+            clean = to_float_images(unlabeled_set.images[next(unlabeled_iter)])
+            noisy = noisy_images(clean)
 
             optimizer.zero_grad()
 
             # Labeled stream: same as behaviour cloning
-            supervised, pred_left, pred_right = action_loss(student, supervised_criterion, images, expert_left, expert_right)
+            supervised, pred_left, pred_right = action_loss(student, supervised_criterion, images, actions)
 
             # Unlabeled stream: Student on noisy frame vs Teacher on clean frame
             with torch.no_grad():
@@ -171,28 +181,53 @@ def setup(lr: float = 1e-3, data_files=None):
             optimizer.step()
             ema_update(teacher, student, EMA_DECAY)
 
-            totals["loss"] += loss.item()
-            totals["supervised"] += supervised.item()
-            totals["consistency"] += consistency.item()
+            totals += torch.stack([loss.detach(), supervised.detach(), consistency.detach()])
 
             if step % 50 == 0:
-                print_batch_diagnostics(step, steps_per_epoch, loss.item(), pred_left[0], pred_right[0], expert_left[0], expert_right[0])
+                print_batch_diagnostics(step, steps_per_epoch, loss.item(), pred_left[0], pred_right[0], actions[0, 0], actions[0, 1])
 
-        means = {k: v / steps_per_epoch for k, v in totals.items()}
+        mean_loss, mean_supervised, mean_consistency = (totals / steps_per_epoch).tolist()
         message = (
-            f"[EPOCH {epoch}] Loss: {means['loss']:.5f} "
-            f"(supervised {means['supervised']:.5f}, consistency {means['consistency']:.5f} x{weight:.2f})"
+            f"[EPOCH {epoch}] Loss: {mean_loss:.5f} "
+            f"(supervised {mean_supervised:.5f}, consistency {mean_consistency:.5f} x{weight:.2f})"
         )
 
-        if val_loader is not None:
-            teacher_val = evaluate_loss(teacher, supervised_criterion, val_loader)
-            student_val = evaluate_loss(student, supervised_criterion, val_loader)
+        teacher_val = student_val = None
+        if val_set is not None:
+            teacher_val = evaluate_loss(teacher, supervised_criterion, val_set)
+            student_val = evaluate_loss(student, supervised_criterion, val_set)
             message += f" | Val loss teacher: {teacher_val:.5f}, student: {student_val:.5f}"
             if teacher_val < best_val_loss:
                 best_val_loss = teacher_val
                 message += "  (best so far)"
 
         print(message)
-        return means["supervised"]
+        return {
+            "loss": mean_supervised,
+            "total_loss": mean_loss,
+            "consistency_loss": mean_consistency,
+            "consistency_weight": weight,
+            "val_loss": teacher_val,
+            "student_val_loss": student_val,
+        }
+
+    # Saved/restored by run_training.py so resumed sessions continue seamlessly
+    # (the Teacher's weights are the saved model itself)
+    def get_state() -> dict:
+        return {
+            "optimizer": to_cpu(optimizer.state_dict()),
+            "student": to_cpu(student.state_dict()),
+            "best_val_loss": best_val_loss,
+        }
+
+    def set_state(state: dict) -> None:
+        nonlocal best_val_loss, first_step
+        student.load_state_dict(state["student"])
+        optimizer.load_state_dict(state["optimizer"])
+        best_val_loss = state.get("best_val_loss", float("inf"))
+        first_step = False  # Student restored, don't overwrite it with the Teacher
+
+    train_step.get_state = get_state
+    train_step.set_state = set_state
 
     return teacher, train_step, "Semi-Supervised Learning (Mean Teacher)"

@@ -1,17 +1,22 @@
 """
-Shared training code for the BC and SemiSL pipelines:
-diagnostics, recording loading, train/validation split, augmentation and evaluation.
+Shared training code for the BC, SemiSL and RL pipelines:
+device selection, diagnostics, recording loading, train/validation split,
+batch augmentation and evaluation.
+
+Training works on CPU (e.g. Linux laptop) and CUDA (e.g. Windows + RTX 3060).
+All frames are kept in memory on the training device and augmented a whole
+batch at a time there, so the GPU isn't waiting for the CPU.
 """
 
 import io
+import math
 import zlib
 import pickle
 from pathlib import Path
 from PIL import Image, ImageFile
 
 import torch
-from torch.utils.data import Dataset
-import torchvision.transforms as transforms
+import torch.nn.functional as F
 
 from arkitektur import IMAGE_SIZE, image_to_uint8_tensor
 
@@ -20,6 +25,52 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 VALIDATION_PERCENT = 15  # Share of recordings held out for validation
 IDLE_THRESHOLD = 0.02    # |left| and |right| below this counts as standing still
 NOISE_STD = 0.03         # Gaussian pixel noise added to "noisy" frames
+
+# Augmentation strength
+CROP_SCALE = (0.85, 1.0)   # Share of the image area kept by the random crop
+CROP_RATIO = (0.9, 1.1)    # Aspect ratio range of the crop
+BRIGHTNESS = 0.3
+CONTRAST = 0.3
+SATURATION = 0.3
+HUE = 0.03                 # Fraction of a full turn around the color wheel
+
+
+# ==============================================================================
+# DEVICE
+# ==============================================================================
+def resolve_device(name: str = "auto") -> torch.device:
+    """"auto" = CUDA if available, else CPU. Asking for CUDA without a GPU is an error."""
+    name = (name or "auto").lower()
+    if name == "auto":
+        name = "cuda" if torch.cuda.is_available() else "cpu"
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but this torch install can't see a GPU "
+                f"(torch {torch.__version__}). Install the CUDA build: "
+                "pip install -r requirements-cuda.txt"
+            )
+        torch.backends.cudnn.benchmark = True  # Input size never changes, let cuDNN pick fast kernels
+    elif name != "cpu":
+        raise ValueError(f"Unknown device '{name}', use cpu, cuda or auto.")
+    return torch.device(name)
+
+
+def describe_device(device: torch.device) -> str:
+    if device.type == "cuda":
+        return f"cuda ({torch.cuda.get_device_name(device)})"
+    return "cpu"
+
+
+def to_cpu(obj):
+    """Recursively moves tensors to the CPU, so saved files load on computers without CUDA."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return type(obj)((key, to_cpu(value)) for key, value in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(to_cpu(value) for value in obj)
+    return obj
 
 
 # ==============================================================================
@@ -72,31 +123,107 @@ def split_files_by_recording(data_files) -> tuple[list[str], list[str]]:
     return train_files, val_files
 
 
-# --- Augmentation (operates on float tensors (3, 64, 64) in [0, 1]) ---
-_random_crop = transforms.RandomResizedCrop(
-    IMAGE_SIZE, scale=(0.85, 1.0), ratio=(0.9, 1.1), antialias=True
-)
-_color_jitter = transforms.ColorJitter(
-    brightness=0.3, contrast=0.3, saturation=0.3, hue=0.03
-)
+# ==============================================================================
+# BATCH AUGMENTATION (float tensors (B, 3, 64, 64) in [0, 1], on any device)
+# ==============================================================================
+_RGB_TO_YIQ = torch.tensor([
+    [0.299, 0.587, 0.114],
+    [0.596, -0.274, -0.322],
+    [0.211, -0.523, 0.312],
+])
+_YIQ_TO_RGB = torch.linalg.inv(_RGB_TO_YIQ)
 
 
-def augment_frame(image: torch.Tensor) -> torch.Tensor:
-    """Random small crop/zoom plus brightness, contrast, saturation and hue changes."""
-    return _color_jitter(_random_crop(image))
+def _uniform(batch: int, low: float, high: float, device) -> torch.Tensor:
+    return torch.empty(batch, device=device).uniform_(low, high)
 
 
-def noisy_frame(image: torch.Tensor) -> torch.Tensor:
-    """A "noisy" version of a frame for consistency training.
+def _grayscale(images: torch.Tensor) -> torch.Tensor:
+    return (0.299 * images[:, 0:1] + 0.587 * images[:, 1:2] + 0.114 * images[:, 2:3])
+
+
+def augment_images(images: torch.Tensor) -> torch.Tensor:
+    """Random small crop/zoom plus brightness, contrast, saturation and hue changes, per image."""
+    batch, device = images.shape[0], images.device
+
+    # Random resized crop, done as a per-image zoom + shift
+    area = _uniform(batch, *CROP_SCALE, device)
+    ratio = _uniform(batch, math.log(CROP_RATIO[0]), math.log(CROP_RATIO[1]), device).exp()
+    width = (area * ratio).sqrt().clamp(max=1.0)
+    height = (area / ratio).sqrt().clamp(max=1.0)
+    theta = torch.zeros(batch, 2, 3, device=device)
+    theta[:, 0, 0] = width
+    theta[:, 1, 1] = height
+    theta[:, 0, 2] = (torch.rand(batch, device=device) * 2 - 1) * (1 - width)
+    theta[:, 1, 2] = (torch.rand(batch, device=device) * 2 - 1) * (1 - height)
+    grid = F.affine_grid(theta, list(images.shape), align_corners=False)
+    images = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+    # Brightness
+    images = (images * _uniform(batch, 1 - BRIGHTNESS, 1 + BRIGHTNESS, device).view(-1, 1, 1, 1)).clamp(0, 1)
+
+    # Contrast: blend towards the image's mean gray level
+    mean_gray = _grayscale(images).mean(dim=(1, 2, 3), keepdim=True)
+    factor = _uniform(batch, 1 - CONTRAST, 1 + CONTRAST, device).view(-1, 1, 1, 1)
+    images = ((images - mean_gray) * factor + mean_gray).clamp(0, 1)
+
+    # Saturation: blend towards the grayscale image
+    gray = _grayscale(images)
+    factor = _uniform(batch, 1 - SATURATION, 1 + SATURATION, device).view(-1, 1, 1, 1)
+    images = ((images - gray) * factor + gray).clamp(0, 1)
+
+    # Hue: rotate the color part (I, Q) in YIQ color space
+    angle = _uniform(batch, -HUE, HUE, device) * 2 * math.pi
+    rotation = torch.zeros(batch, 3, 3, device=device)
+    rotation[:, 0, 0] = 1.0
+    rotation[:, 1, 1] = angle.cos()
+    rotation[:, 1, 2] = -angle.sin()
+    rotation[:, 2, 1] = angle.sin()
+    rotation[:, 2, 2] = angle.cos()
+    matrix = _YIQ_TO_RGB.to(device) @ rotation @ _RGB_TO_YIQ.to(device)
+    images = torch.einsum("bij,bjhw->bihw", matrix, images).clamp(0, 1)
+
+    return images
+
+
+def augment_labeled_batch(images: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Augmentation for (state S, action A) pairs. Mirrored frames get swapped wheel values."""
+    # Mirror the frame: a left turn becomes a right turn, so the wheels swap
+    flip = torch.rand(images.shape[0], device=images.device) < 0.5
+    images = torch.where(flip.view(-1, 1, 1, 1), images.flip(-1), images)
+    actions = torch.where(flip.view(-1, 1), actions.flip(-1), actions)
+    return augment_images(images), actions
+
+
+def noisy_images(images: torch.Tensor) -> torch.Tensor:
+    """A "noisy" version of frames for consistency training.
 
     No mirroring here: a mirrored frame should get mirrored wheel values,
     which would break the "same state, same action" idea of consistency loss.
     """
-    image = augment_frame(image)
-    image = image + torch.randn_like(image) * NOISE_STD
-    return image.clamp(0.0, 1.0)
+    images = augment_images(images)
+    return (images + torch.randn_like(images) * NOISE_STD).clamp(0, 1)
 
 
+def to_float_images(images_uint8: torch.Tensor) -> torch.Tensor:
+    return images_uint8.float() / 255.0
+
+
+def batch_indices(count: int, batch_size: int, device, shuffle: bool = True):
+    """Yields index tensors for one pass over `count` samples."""
+    order = torch.randperm(count, device=device) if shuffle else torch.arange(count, device=device)
+    yield from order.split(batch_size)
+
+
+def endless_batch_indices(count: int, batch_size: int, device):
+    """Yields shuffled index batches forever, reshuffling every pass."""
+    while True:
+        yield from batch_indices(count, batch_size, device, shuffle=True)
+
+
+# ==============================================================================
+# LOADING RECORDINGS
+# ==============================================================================
 def load_recording_file(path: Path, name: str):
     """Loads one recording (a pickled list of {'image', 'action'} dicts), or None on failure."""
     try:
@@ -121,11 +248,13 @@ def stack_frames(images: list[torch.Tensor]) -> torch.Tensor:
     return torch.empty((0, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8)
 
 
-class DrivingDataset(Dataset):
-    """Labeled frames (state S, expert action A) kept in memory as 64x64 uint8 tensors."""
-    def __init__(self, file_paths, filter_zeros=True, augment=False, name="Dataset"):
-        self.augment = augment
+class DrivingDataset:
+    """Labeled frames (state S, expert action A).
 
+    images: uint8 (N, 3, 64, 64), actions: float (N, 2) as (left, right).
+    Call .to(device) to move both to the training device.
+    """
+    def __init__(self, file_paths, filter_zeros=True, name="Dataset"):
         print(f"[{name}] Loading {len(file_paths)} recording files...")
         images = []
         actions = []
@@ -180,22 +309,14 @@ class DrivingDataset(Dataset):
     def __len__(self):
         return len(self.actions)
 
-    def __getitem__(self, idx):
-        image = self.images[idx].float() / 255.0
-        left, right = self.actions[idx]
-
-        if self.augment:
-            # Mirror the frame: a left turn becomes a right turn, so the wheels swap
-            if torch.rand(1).item() < 0.5:
-                image = torch.flip(image, dims=[2])
-                left, right = right, left
-            image = augment_frame(image)
-
-        return image, left.reshape(1), right.reshape(1)
+    def to(self, device):
+        self.images = self.images.to(device)
+        self.actions = self.actions.to(device)
+        return self
 
 
-class UnlabeledDataset(Dataset):
-    """Frames used without their actions (state S only). Returns (clean, noisy) pairs."""
+class UnlabeledDataset:
+    """Frames used without their actions (state S only). images: uint8 (N, 3, 64, 64)."""
     def __init__(self, file_paths, name="Unlabeled"):
         print(f"[{name}] Loading {len(file_paths)} recording files...")
         images = []
@@ -221,30 +342,32 @@ class UnlabeledDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def __getitem__(self, idx):
-        clean = self.images[idx].float() / 255.0
-        return clean, noisy_frame(clean)
+    def to(self, device):
+        self.images = self.images.to(device)
+        return self
 
 
-def action_loss(model, criterion, images, expert_left, expert_right):
-    """Supervised loss between the model's actions Â and the expert's actions A."""
+# ==============================================================================
+# LOSS & EVALUATION
+# ==============================================================================
+def action_loss(model, criterion, images, actions):
+    """Supervised loss between the model's actions Â and the expert's actions A (N, 2)."""
     pred_left, pred_right = model(images)
-    loss = criterion(pred_left, expert_left) + criterion(pred_right, expert_right)
+    loss = criterion(pred_left, actions[:, 0:1]) + criterion(pred_right, actions[:, 1:2])
     return loss, pred_left, pred_right
 
 
 @torch.no_grad()
-def evaluate_loss(model, criterion, loader) -> float:
-    """Mean supervised loss over a loader, with the model in eval mode."""
+def evaluate_loss(model, criterion, dataset: DrivingDataset, batch_size: int = 256) -> float:
+    """Mean supervised loss over a dataset (no augmentation), with the model in eval mode."""
     was_training = model.training
     model.eval()
-    total_loss, total_samples = 0.0, 0
-    for images, expert_left, expert_right in loader:
-        loss, _, _ = action_loss(model, criterion, images, expert_left, expert_right)
-        total_loss += loss.item() * len(images)
-        total_samples += len(images)
+    total_loss = 0.0
+    for idx in batch_indices(len(dataset), batch_size, dataset.images.device, shuffle=False):
+        loss, _, _ = action_loss(model, criterion, to_float_images(dataset.images[idx]), dataset.actions[idx])
+        total_loss += loss.item() * len(idx)
     model.train(was_training)
-    return total_loss / total_samples
+    return total_loss / len(dataset)
 
 
 def print_mean_baseline(criterion, train_actions, val_actions) -> None:
