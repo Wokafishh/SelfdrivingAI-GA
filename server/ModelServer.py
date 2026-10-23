@@ -202,6 +202,12 @@ class ESP32StreamerApp:
         self.lbl_cmd_visual = ttk.Label(cmd_frame, text="STOP (0.00, 0.00)", font=("Helvetica", 10, "bold"), foreground="#7f8c8d")
         self.lbl_cmd_visual.pack(side=tk.LEFT, padx=4)
 
+        # AI diagnostics: what the network said vs. what the minimum output turned it into
+        self.lbl_ai_raw = ttk.Label(self.control_panel, text="Model output (raw): -", font=("Courier", 9))
+        self.lbl_ai_raw.pack(anchor="w", pady=(4, 0))
+        self.lbl_ai_sent = ttk.Label(self.control_panel, text="Sent to motors:     -", font=("Courier", 9))
+        self.lbl_ai_sent.pack(anchor="w")
+
         self.lbl_connection_status = ttk.Label(self.control_panel, text="Status: Waiting for ESP32 Connection...", font=("Helvetica", 9, "italic"), foreground="#e67e22")
         self.lbl_connection_status.pack(anchor="w", pady=(15, 0))
 
@@ -276,6 +282,8 @@ class ESP32StreamerApp:
 
     def _on_mode_change(self):
         if self.manual_control_var.get():
+            self.lbl_ai_raw.config(text="Model output (raw): -")
+            self.lbl_ai_sent.config(text="Sent to motors:     -")
             self.lbl_mode_status.config(text="Current Mode: Manual (Keyboard)", foreground="#27ae60")
         else:
             if self.model is None:
@@ -302,6 +310,15 @@ class ESP32StreamerApp:
             return (left, right)
         scale = minimum / strongest
         return (left * scale, right * scale)
+
+    def _show_ai_diagnostic(self, raw_cmd, sent_cmd):
+        """Shows the raw network output next to the (possibly scaled up) command that is sent."""
+        strongest = max(abs(raw_cmd[0]), abs(raw_cmd[1]))
+        scale = max(abs(sent_cmd[0]), abs(sent_cmd[1])) / strongest if strongest > 1e-6 else 1.0
+        scale_text = f"x{scale:.2f} (min output {self.min_output_var.get():g})" if abs(scale - 1.0) > 1e-3 else "unchanged"
+        self.lbl_ai_raw.config(text=f"Model output (raw): L {raw_cmd[0]:+.3f}  R {raw_cmd[1]:+.3f}")
+        self.lbl_ai_sent.config(text=f"Sent to motors:     L {sent_cmd[0]:+.3f}  R {sent_cmd[1]:+.3f}  {scale_text}")
+        print(f"[AI] Raw L {raw_cmd[0]:+.4f} R {raw_cmd[1]:+.4f} -> Sent L {sent_cmd[0]:+.4f} R {sent_cmd[1]:+.4f} | {scale_text}")
 
     def _load_model_inference(self, pil_img):
             """Passes the incoming PIL image through DrivingNetwork with robust diagnostics."""
@@ -330,8 +347,6 @@ class ESP32StreamerApp:
                 else:
                     left_val, right_val = float(res[0]), float(res[1])
 
-                # Live Diagnostic Console Log
-                print(f"[AI INFERENCE DIAGNOSTIC] Pred Left: {left_val:+.4f} | Pred Right: {right_val:+.4f}")
                 return (float(left_val), float(right_val))
 
             except Exception as e:
@@ -522,8 +537,9 @@ class ESP32StreamerApp:
 
                 # If AI Model mode is active, run inference through DrivingNetwork
                 if not self.manual_control_var.get():
-                    ai_cmd = self._load_model_inference(img)
-                    ai_cmd = self._apply_min_output(ai_cmd)
+                    raw_cmd = self._load_model_inference(img)
+                    ai_cmd = self._apply_min_output(raw_cmd)
+                    self._show_ai_diagnostic(raw_cmd, ai_cmd)
                     self.current_cmd = ai_cmd
                     self._update_command_visual(ai_cmd)
                     self._send_control_packet(ai_cmd)

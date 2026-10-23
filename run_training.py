@@ -10,6 +10,10 @@ Time-limited sessions (e.g. 6 x 5 minutes with real-life tests in between):
     is thrown away, so the saved model is exactly "N completed iterations".
   - Running the same command again resumes: weights, optimizer state and the
     iteration counter continue where the last session stopped.
+  - Several sessions in a row (e.g. 6 x 5 minutes, unattended):
+        python run_training.py --method bc --minutes 5 --intervals 6 --data a --name bc_final --device cuda
+    saves <name>_session1 ... _session5 after each interval and <name>_final after the last,
+    and logs the iterations per interval to training_logs/<name>_intervals.csv.
   - Every session saves a snapshot temp_models/<name>_session<N>.pt and logs to
     training_logs/<name>_sessions.csv (one row per session) and
     training_logs/<name>_iterations.csv (one row per iteration).
@@ -61,8 +65,8 @@ TRAINING_MODULES = {
 DATASET_METHODS = {"bc", "semisl"}
 
 
-def prompt_user_config(args) -> tuple[str, float | None, int | None, str, str, str]:
-    """Fills in method, time limit, epochs, dataset mode, model filename and device.
+def prompt_user_config(args) -> tuple[str, float | None, int | None, int, str, str, str]:
+    """Fills in method, time limit, epochs, intervals, dataset mode, model filename and device.
 
     Anything given on the command line is used as-is; the rest is asked for.
     """
@@ -92,11 +96,22 @@ def prompt_user_config(args) -> tuple[str, float | None, int | None, str, str, s
             epochs_input = input(f"3. Enter number of epochs (RL: iterations) (default: {DEFAULT_EPOCHS}): ").strip()
             epochs = int(epochs_input) if epochs_input else DEFAULT_EPOCHS
 
+    intervals = args.intervals
+    if intervals is None:
+        if args.minutes is None:  # Interactive run: always ask (scripts passing --minutes get 1)
+            length = f"{minutes:g} min" if minutes is not None else (f"{epochs}-epoch" if epochs else "")
+            intervals_input = input(f"4. Number of {length} intervals in a row, saved as _session1.._final "
+                                    f"(e.g. 6, blank = 1): ").strip()
+            intervals = int(intervals_input) if intervals_input else 1
+        else:
+            intervals = 1
+    intervals = max(1, intervals)
+
     cache_input = args.data
     if method not in DATASET_METHODS:
         cache_input = "i"
     elif cache_input is None:
-        print("4. Dataset selection:")
+        print("5. Dataset selection:")
         print("   [a]ll recordings (default)")
         print("   [n]ew recordings only (not yet in used_data.txt, for fine-tuning a resumed model)")
         print("   [r]eset log (clear used_data.txt, then train on all recordings)")
@@ -115,7 +130,7 @@ def prompt_user_config(args) -> tuple[str, float | None, int | None, str, str, s
     filename = args.name
     if filename is None:
         default_filename = f"{method}_model.pt"
-        filename_input = input(f"5. Enter model filename to save/resume (default: {default_filename}): ").strip()
+        filename_input = input(f"6. Enter model filename to save/resume (default: {default_filename}): ").strip()
         filename = filename_input if filename_input else default_filename
     if not filename.endswith(".pt"):
         filename += ".pt"
@@ -126,11 +141,11 @@ def prompt_user_config(args) -> tuple[str, float | None, int | None, str, str, s
             default_device, found = "cuda", f"GPU found: {torch.cuda.get_device_name(0)}"
         else:
             default_device, found = "cpu", f"no CUDA GPU found, torch {torch.__version__}"
-        device_input = input(f"6. Train on [cpu/cuda] (default: {default_device}, {found}): ").strip().lower()
+        device_input = input(f"7. Train on [cpu/cuda] (default: {default_device}, {found}): ").strip().lower()
         device = device_input if device_input else default_device
 
     print("=" * 60 + "\n")
-    return method, minutes, epochs, cache_mode, filename, device
+    return method, minutes, epochs, intervals, cache_mode, filename, device
 
 
 def select_dataset_files(data_dir: Path, cache_file: Path, cache_mode: str) -> tuple[list[str], list[str]]:
@@ -163,6 +178,10 @@ def select_dataset_files(data_dir: Path, cache_file: Path, cache_mode: str) -> t
     print(f"[DATA TRACKING] {len(new_files)} new files, {len(all_files) - len(new_files)} previously used files.")
 
     if cache_mode == "new":
+        if not new_files:
+            # Nothing new recorded: train on everything instead of stopping with an empty dataset
+            print(f"[DATA TRACKING] No new files, falling back to all {len(all_files)} files.")
+            return all_files, []
         print(f"[DATA TRACKING] Training on the {len(new_files)} new files only.")
         return new_files, new_files
 
@@ -222,6 +241,8 @@ def display_results(stats: dict) -> None:
     print(f" Improvement     : {diff:.6f} ({pct:.1f}%)")
     print(f" Partial Weights : {stats.get('checkpoint_path', 'N/A')}")
     print(f" Final Model     : {stats.get('save_path', 'N/A')}")
+    if stats.get("best_path"):
+        print(f" Best Val Model  : {stats['best_path']} (val loss {stats['best_val_loss']:.6f})")
     print(f" Session Snapshot: {stats.get('snapshot_path', 'N/A')}")
     print(f" Logs            : {stats.get('sessions_log', 'N/A')}")
     print(f"                   {stats.get('iterations_log', 'N/A')}")
@@ -232,6 +253,37 @@ def display_results(stats: dict) -> None:
         for warning in warnings:
             print(f"   * {warning}")
     print("=" * 55 + "\n")
+
+
+def display_interval_summary(all_results: list[dict], planned: int, intervals_log: Path, started_at: str) -> None:
+    """Table of how many iterations each interval got, also appended to <name>_intervals.csv."""
+    print("=" * 78)
+    print(f" INTERVAL SUMMARY ({len(all_results)} of {planned} intervals run)")
+    print("=" * 78)
+    print(f" {'Interval':<9}{'Iterations':>11}{'Total':>8}{'Minutes':>9}{'Loss':>11}{'Val loss':>11}  Saved as")
+    for interval, stats in enumerate(all_results, start=1):
+        val = stats.get("final_val_loss")
+        print(f" {interval:<9}{stats['iterations']:>11}{stats['total_iterations']:>8}"
+              f"{stats['session_seconds'] / 60:>9.2f}{stats['final_loss']:>11.5f}"
+              f"{(f'{val:.5f}' if val is not None else '-'):>11}  {Path(stats['snapshot_path']).name}")
+        append_csv_row(intervals_log, {
+            "run_started_at": started_at,
+            "interval": interval,
+            "planned_intervals": planned,
+            "session": stats["session"],
+            "stopped_by": stats["stopped_by"],
+            "iterations": stats["iterations"],
+            "total_iterations": stats["total_iterations"],
+            "minutes": round(stats["session_seconds"] / 60, 3),
+            "final_loss": stats["final_loss"],
+            "final_val_loss": val if val is not None else "",
+            "snapshot": stats["snapshot_path"],
+        })
+    best = all_results[-1].get("best_path")
+    if best:
+        print(f"\n Best val model over all intervals: {best} (val loss {all_results[-1]['best_val_loss']:.6f})")
+    print(f" Iterations per interval logged to {intervals_log}")
+    print("=" * 78 + "\n")
 
 
 # ==============================================================================
@@ -319,7 +371,12 @@ class TimeLimit:
 
     Code inside `protected()` (saving files) is never interrupted halfway;
     the interrupt then happens right after it.
+
+    Python silently drops a KeyboardInterrupt that lands in some internal cleanup code
+    (e.g. a weakref callback), so the interrupt is repeated until cancel() confirms the stop.
     """
+    RETRY_SECONDS = 2.0
+
     def __init__(self, seconds: float | None):
         self.seconds = seconds
         self.reached = threading.Event()
@@ -327,6 +384,7 @@ class TimeLimit:
         self._protected = False
         self._pending = False
         self._timer = None
+        self._stopped = threading.Event()
 
     def start(self) -> None:
         if self.seconds is None:
@@ -336,16 +394,23 @@ class TimeLimit:
         self._timer.start()
 
     def cancel(self) -> None:
+        with self._lock:
+            self._stopped.set()
         if self._timer is not None:
             self._timer.cancel()
 
     def _fire(self) -> None:
-        with self._lock:
-            self.reached.set()
-            if self._protected:
-                self._pending = True
-            else:
-                _thread.interrupt_main()
+        self.reached.set()
+        while True:
+            with self._lock:
+                if self._stopped.is_set():
+                    return
+                if self._protected:
+                    self._pending = True
+                else:
+                    _thread.interrupt_main()
+            if self._stopped.wait(self.RETRY_SECONDS):
+                return
 
     @contextmanager
     def protected(self):
@@ -361,8 +426,68 @@ class TimeLimit:
                 raise KeyboardInterrupt
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else f"{rest // 60:02d}:{rest % 60:02d}"
+
+
+class Countdown:
+    """Live "time left" line at the bottom of the terminal while an iteration runs.
+
+    Only used in a real terminal: in the Webots console or a log file the per-iteration
+    [PROGRESS] lines show the remaining time instead.
+    """
+    def __init__(self, seconds: float | None, start_time: float):
+        self.seconds = seconds
+        self.start_time = start_time
+        self.enabled = seconds is not None and sys.stdout.isatty()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        if self.enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            left = self.seconds - (time.perf_counter() - self.start_time)
+            # Written then the cursor goes back to the line start, so the next print overwrites it
+            sys.stdout.write(f"\r[TIMER] {format_duration(left)} left of {format_duration(self.seconds)} \r")
+            sys.stdout.flush()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
+def progress_line(session_iteration: int, iteration_seconds: float, elapsed: float,
+                  time_limit_seconds: float | None, epochs: int | None) -> str:
+    """Elapsed time, time left and how many more iterations should fit."""
+    average = elapsed / session_iteration
+    parts = [f"Iteration took {iteration_seconds:.1f} s", f"elapsed {format_duration(elapsed)}"]
+    more, eta = None, None
+    if time_limit_seconds is not None:
+        left = max(0.0, time_limit_seconds - elapsed)
+        parts.append(f"{format_duration(left)} left ({elapsed / time_limit_seconds:.0%} of the time limit)")
+        more, eta = int(left // average), left
+    if epochs is not None:
+        parts.append(f"{session_iteration}/{epochs} iterations")
+        by_epochs = epochs - session_iteration
+        if more is None or by_epochs < more:
+            more, eta = by_epochs, by_epochs * average
+    if more is not None:
+        parts.append(f"~{more} more iteration{'s' if more != 1 else ''}, done in ~{format_duration(eta)}")
+    return "[PROGRESS] " + " | ".join(parts)
+
+
 def run_session(model, step_fn, method_name, save_path, checkpoint_path,
-                epochs=None, time_limit_minutes=None, log_dir=DEFAULT_LOG_DIR, device_name="") -> dict:
+                epochs=None, time_limit_minutes=None, log_dir=DEFAULT_LOG_DIR, device_name="",
+                snapshot_suffix=None) -> dict:
     """Runs one training session: resume, train until epochs or time limit, save, snapshot, log.
 
     epochs=None means "no epoch limit" (stop on the time limit or Ctrl+C).
@@ -373,16 +498,22 @@ def run_session(model, step_fn, method_name, save_path, checkpoint_path,
 
     resumed = resume_weights(model, checkpoint_path, save_path)
     base_iterations, base_seconds = 0, 0.0
+    best_val_loss = float("inf")
     if resumed and state_path.exists():
         saved = load_pickle(state_path)
         base_iterations = saved.get("iterations", 0)
         base_seconds = saved.get("training_seconds", 0.0)
+        best_val_loss = saved.get("best_val_loss", float("inf"))
         if saved.get("module_state") is not None and hasattr(step_fn, "set_state"):
             step_fn.set_state(saved["module_state"])
         print(f"[RESUME] Continuing after iteration {base_iterations} "
               f"({base_seconds / 60:.2f} min trained so far).")
 
     stem = save_path.stem
+    # The model with the lowest validation loss so far. Later epochs can overfit and get
+    # worse, so this copy is often the best one to test on the real car.
+    best_path = save_path.with_name(f"{stem}_best.pt")
+    best_iteration = None
     sessions_log = log_dir / f"{stem}_sessions.csv"
     iterations_log = log_dir / f"{stem}_iterations.csv"
     session = count_csv_rows(sessions_log) + 1
@@ -399,9 +530,11 @@ def run_session(model, step_fn, method_name, save_path, checkpoint_path,
     print(f"[TRAIN] Session {session}: {limit_text}, {epochs_text}...")
 
     session_start = time.perf_counter()
+    countdown = Countdown(limit.seconds, session_start)
     try:
         try:
             limit.start()
+            countdown.start()
             for session_iteration in (itertools.count(1) if epochs is None else range(1, epochs + 1)):
                 iteration = base_iterations + session_iteration
                 iteration_start = time.perf_counter()
@@ -424,13 +557,23 @@ def run_session(model, step_fn, method_name, save_path, checkpoint_path,
 
                     last_completed_weights = to_cpu(model.state_dict())
                     atomic_save(last_completed_weights, checkpoint_path)
+                    val_loss = metrics.get("val_loss")
+                    if val_loss is not None and val_loss < best_val_loss:
+                        best_val_loss, best_iteration = val_loss, iteration
+                        atomic_save(last_completed_weights, best_path)
                     atomic_save({
                         "iterations": iteration,
                         "training_seconds": base_seconds + completed_seconds,
+                        "best_val_loss": best_val_loss,
                         "module_state": step_fn.get_state() if hasattr(step_fn, "get_state") else None,
                     }, state_path)
+
+                if best_iteration == iteration:
+                    print(f"[BEST] New lowest val loss {best_val_loss:.5f}, saved to {best_path}")
+                print(progress_line(session_iteration, now - iteration_start, completed_seconds, limit.seconds, epochs))
         finally:
             limit.cancel()
+            countdown.stop()
     except KeyboardInterrupt:
         stopped_by = "time_limit" if limit.reached.is_set() else "user"
         print(f"\n[STOPPED] {'Time limit reached' if stopped_by == 'time_limit' else 'KeyboardInterrupt'}. "
@@ -441,7 +584,7 @@ def run_session(model, step_fn, method_name, save_path, checkpoint_path,
     model.load_state_dict(last_completed_weights)
 
     atomic_save(last_completed_weights, save_path)
-    snapshot_path = save_path.with_name(f"{stem}_session{session}.pt")
+    snapshot_path = save_path.with_name(f"{stem}_{snapshot_suffix or f'session{session}'}.pt")
     shutil.copy2(save_path, snapshot_path)
 
     losses = [row["loss"] for row in history]
@@ -480,7 +623,10 @@ def run_session(model, step_fn, method_name, save_path, checkpoint_path,
         "total_seconds": base_seconds + completed_seconds,
         "start_loss": losses[0] if losses else 0.0,
         "final_loss": losses[-1] if losses else 0.0,
+        "final_val_loss": history[-1].get("val_loss") if history else None,
         "save_path": str(save_path),
+        "best_path": str(best_path) if best_path.exists() else None,
+        "best_val_loss": best_val_loss if best_path.exists() else None,
         "checkpoint_path": str(checkpoint_path),
         "snapshot_path": str(snapshot_path),
         "sessions_log": str(sessions_log),
@@ -493,6 +639,9 @@ if __name__ == "__main__":
     parser.add_argument("--method", choices=list(TRAINING_MODULES), default=None, help="Training method (asked if omitted)")
     parser.add_argument("--minutes", type=float, default=None, help="Time limit per session in minutes, 0 = no limit (asked if omitted)")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs/iterations (asked if omitted)")
+    parser.add_argument("--intervals", type=int, default=None,
+                        help="Run this many --minutes sessions in a row, e.g. --minutes 5 --intervals 6. "
+                             "Saves <name>_session<N> after each and <name>_final after the last (default: 1)")
     parser.add_argument("--data", choices=["a", "n", "r", "i"], default=None, help="Dataset selection: all/new/reset/ignore (asked if omitted)")
     parser.add_argument("--name", type=str, default=None, help="Model filename to save/resume (asked if omitted)")
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default=None, help="Training device, auto = cuda if available (asked if omitted)")
@@ -504,7 +653,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    method, minutes, epochs, cache_mode, filename, device_choice = prompt_user_config(args)
+    method, minutes, epochs, intervals, cache_mode, filename, device_choice = prompt_user_config(args)
+    if intervals > 1 and minutes is None and epochs is None:
+        print("[ERROR] --intervals needs --minutes or --epochs, otherwise the first interval never ends.")
+        sys.exit(1)
 
     if method not in TRAINING_MODULES:
         raise ValueError(f"Unknown method '{method}'. Registered modules: {list(TRAINING_MODULES.keys())}")
@@ -572,15 +724,34 @@ if __name__ == "__main__":
         lr_kwargs = {"lr": args.lr} if args.lr is not None else {}
         model, step_fn, method_name = module.setup(data_files=dataset_files, device=device, **lr_kwargs)
 
-        results = run_session(model, step_fn, method_name, save_path, checkpoint_path,
-                              epochs=epochs, time_limit_minutes=minutes, log_dir=args.log_dir,
-                              device_name=describe_device(device))
-        if results["iterations"] > 0:
-            mark_files_used(used_data_cache_file, new_dataset_files)
+        # Each interval is a normal session (it resumes from the one before);
+        # the last one of several is saved as <name>_final instead of <name>_session<N>
+        all_results = []
+        run_started_at = datetime.now().isoformat(timespec="seconds")
+        for interval in range(1, intervals + 1):
+            if intervals > 1:
+                print(f"\n{'#' * 60}\n# INTERVAL {interval}/{intervals}\n{'#' * 60}")
+            results = run_session(model, step_fn, method_name, save_path, checkpoint_path,
+                                  epochs=epochs, time_limit_minutes=minutes, log_dir=args.log_dir,
+                                  device_name=describe_device(device),
+                                  snapshot_suffix="final" if intervals > 1 and interval == intervals else None)
+            if results["iterations"] > 0 and new_dataset_files:
+                mark_files_used(used_data_cache_file, new_dataset_files)
+                new_dataset_files = []
+            all_results.append(results)
+            if intervals > 1:
+                display_results(results)
+            if results["stopped_by"] == "user":
+                if interval < intervals:
+                    print(f"[INTERVALS] Stopped by the user, skipping the remaining {intervals - interval} intervals.")
+                break
     else:
         available_attrs = [attr for attr in dir(module) if not attr.startswith("_")]
         print(f"[ERROR] Module '{module_name}' loaded, but does not expose a `setup` function.")
         print(f"[DEBUG] Available attributes in {module_name}: {available_attrs}")
         raise AttributeError(f"Module '{method}' must define a `setup(lr, data_files)` function.")
 
-    display_results(results)
+    if intervals > 1:
+        display_interval_summary(all_results, intervals, Path(args.log_dir) / f"{save_path.stem}_intervals.csv", run_started_at)
+    else:
+        display_results(results)

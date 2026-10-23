@@ -34,6 +34,13 @@ CONTRAST = 0.3
 SATURATION = 0.3
 HUE = 0.03                 # Fraction of a full turn around the color wheel
 
+# Adaptive augmentation: when the validation loss stops improving, the model has started
+# memorising the recordings, so augmentation is turned up to make the same frames look new.
+# Strength 1.0 = the values above, 2.0 = twice as strong (e.g. brightness +-0.6).
+AUGMENT_PATIENCE = 3        # Epochs without a new best val loss before turning it up
+AUGMENT_STEP = 0.25
+AUGMENT_MAX_STRENGTH = 2.0
+
 
 # ==============================================================================
 # DEVICE
@@ -142,13 +149,15 @@ def _grayscale(images: torch.Tensor) -> torch.Tensor:
     return (0.299 * images[:, 0:1] + 0.587 * images[:, 1:2] + 0.114 * images[:, 2:3])
 
 
-def augment_images(images: torch.Tensor) -> torch.Tensor:
-    """Random small crop/zoom plus brightness, contrast, saturation and hue changes, per image."""
+def augment_images(images: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+    """Random small crop/zoom plus brightness, contrast, saturation and hue changes, per image.
+    strength scales how far each change can go (see AugmentationSchedule)."""
     batch, device = images.shape[0], images.device
 
     # Random resized crop, done as a per-image zoom + shift
-    area = _uniform(batch, *CROP_SCALE, device)
-    ratio = _uniform(batch, math.log(CROP_RATIO[0]), math.log(CROP_RATIO[1]), device).exp()
+    min_area = max(0.5, 1 - (1 - CROP_SCALE[0]) * strength)
+    area = _uniform(batch, min_area, CROP_SCALE[1], device)
+    ratio = _uniform(batch, math.log(CROP_RATIO[0]) * strength, math.log(CROP_RATIO[1]) * strength, device).exp()
     width = (area * ratio).sqrt().clamp(max=1.0)
     height = (area / ratio).sqrt().clamp(max=1.0)
     theta = torch.zeros(batch, 2, 3, device=device)
@@ -160,20 +169,21 @@ def augment_images(images: torch.Tensor) -> torch.Tensor:
     images = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
     # Brightness
-    images = (images * _uniform(batch, 1 - BRIGHTNESS, 1 + BRIGHTNESS, device).view(-1, 1, 1, 1)).clamp(0, 1)
+    brightness, contrast, saturation, hue = (min(0.9, x * strength) for x in (BRIGHTNESS, CONTRAST, SATURATION, HUE))
+    images = (images * _uniform(batch, 1 - brightness, 1 + brightness, device).view(-1, 1, 1, 1)).clamp(0, 1)
 
     # Contrast: blend towards the image's mean gray level
     mean_gray = _grayscale(images).mean(dim=(1, 2, 3), keepdim=True)
-    factor = _uniform(batch, 1 - CONTRAST, 1 + CONTRAST, device).view(-1, 1, 1, 1)
+    factor = _uniform(batch, 1 - contrast, 1 + contrast, device).view(-1, 1, 1, 1)
     images = ((images - mean_gray) * factor + mean_gray).clamp(0, 1)
 
     # Saturation: blend towards the grayscale image
     gray = _grayscale(images)
-    factor = _uniform(batch, 1 - SATURATION, 1 + SATURATION, device).view(-1, 1, 1, 1)
+    factor = _uniform(batch, 1 - saturation, 1 + saturation, device).view(-1, 1, 1, 1)
     images = ((images - gray) * factor + gray).clamp(0, 1)
 
     # Hue: rotate the color part (I, Q) in YIQ color space
-    angle = _uniform(batch, -HUE, HUE, device) * 2 * math.pi
+    angle = _uniform(batch, -hue, hue, device) * 2 * math.pi
     rotation = torch.zeros(batch, 3, 3, device=device)
     rotation[:, 0, 0] = 1.0
     rotation[:, 1, 1] = angle.cos()
@@ -186,23 +196,65 @@ def augment_images(images: torch.Tensor) -> torch.Tensor:
     return images
 
 
-def augment_labeled_batch(images: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def augment_labeled_batch(images: torch.Tensor, actions: torch.Tensor,
+                          strength: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
     """Augmentation for (state S, action A) pairs. Mirrored frames get swapped wheel values."""
     # Mirror the frame: a left turn becomes a right turn, so the wheels swap
     flip = torch.rand(images.shape[0], device=images.device) < 0.5
     images = torch.where(flip.view(-1, 1, 1, 1), images.flip(-1), images)
     actions = torch.where(flip.view(-1, 1), actions.flip(-1), actions)
-    return augment_images(images), actions
+    return augment_images(images, strength), actions
 
 
-def noisy_images(images: torch.Tensor) -> torch.Tensor:
+def noisy_images(images: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
     """A "noisy" version of frames for consistency training.
 
     No mirroring here: a mirrored frame should get mirrored wheel values,
     which would break the "same state, same action" idea of consistency loss.
     """
-    images = augment_images(images)
+    images = augment_images(images, strength)
     return (images + torch.randn_like(images) * NOISE_STD).clamp(0, 1)
+
+
+class AugmentationSchedule:
+    """Tracks the best validation loss and turns augmentation up when it stops improving.
+
+    BC and SemiSL loop over the same recordings every epoch. Once the model has memorised
+    them, stronger augmentation makes the frames look new again, so long sessions keep
+    learning instead of overfitting. Without validation data the strength stays at 1.0.
+    """
+    def __init__(self):
+        self.strength = 1.0
+        self.best_val_loss = float("inf")
+        self.epochs_without_improvement = 0
+
+    def update(self, val_loss: float | None) -> bool:
+        """Call once per epoch. Returns True if val_loss is a new best."""
+        if val_loss is None:
+            return False
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.epochs_without_improvement = 0
+            return True
+        self.epochs_without_improvement += 1
+        if self.epochs_without_improvement >= AUGMENT_PATIENCE and self.strength < AUGMENT_MAX_STRENGTH:
+            self.strength = min(AUGMENT_MAX_STRENGTH, self.strength + AUGMENT_STEP)
+            self.epochs_without_improvement = 0
+            print(f"[AUGMENT] Val loss hasn't improved for {AUGMENT_PATIENCE} epochs -> "
+                  f"augmentation strength {self.strength:.2f}")
+        return False
+
+    def state_dict(self) -> dict:
+        return {
+            "best_val_loss": self.best_val_loss,
+            "augment_strength": self.strength,
+            "epochs_without_improvement": self.epochs_without_improvement,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.best_val_loss = state.get("best_val_loss", float("inf"))
+        self.strength = state.get("augment_strength", 1.0)
+        self.epochs_without_improvement = state.get("epochs_without_improvement", 0)
 
 
 def to_float_images(images_uint8: torch.Tensor) -> torch.Tensor:

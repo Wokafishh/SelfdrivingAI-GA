@@ -26,6 +26,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 from arkitektur import DrivingNetwork
 from training_common import (
+    AugmentationSchedule,
     DrivingDataset,
     UnlabeledDataset,
     action_loss,
@@ -133,13 +134,13 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
     print(f"\n[SemiSL] {steps_per_epoch} steps per epoch | EMA decay {EMA_DECAY} | "
           f"consistency weight up to {CONSISTENCY_WEIGHT} over {CONSISTENCY_RAMPUP_EPOCHS} epochs\n")
 
-    best_val_loss = float("inf")
+    augmentation = AugmentationSchedule()
     first_step = True
 
     def train_step(epoch: int) -> dict:
         """One epoch of mixed labeled/unlabeled steps. "loss" is the mean supervised loss
         (comparable with BC; the total loss grows while the consistency weight ramps up)."""
-        nonlocal best_val_loss, first_step
+        nonlocal first_step
 
         if first_step:
             # run_training loads resumed weights into the Teacher (the saved model),
@@ -150,16 +151,17 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
         student.train()
         teacher.eval()
         weight = consistency_weight(epoch - 1)
+        strength = augmentation.strength  # Used this epoch, may go up below
         # Summed on the device; calling .item() every step would stall the GPU
         totals = torch.zeros(3, device=device)  # total, supervised, consistency
 
         for step in range(1, steps_per_epoch + 1):
             labeled_idx = next(labeled_iter)
             images, actions = augment_labeled_batch(
-                to_float_images(labeled_set.images[labeled_idx]), labeled_set.actions[labeled_idx]
+                to_float_images(labeled_set.images[labeled_idx]), labeled_set.actions[labeled_idx], strength
             )
             clean = to_float_images(unlabeled_set.images[next(unlabeled_iter)])
-            noisy = noisy_images(clean)
+            noisy = noisy_images(clean, strength)
 
             optimizer.zero_grad()
 
@@ -197,9 +199,9 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
             teacher_val = evaluate_loss(teacher, supervised_criterion, val_set)
             student_val = evaluate_loss(student, supervised_criterion, val_set)
             message += f" | Val loss teacher: {teacher_val:.5f}, student: {student_val:.5f}"
-            if teacher_val < best_val_loss:
-                best_val_loss = teacher_val
+            if augmentation.update(teacher_val):
                 message += "  (best so far)"
+        message += f" | Augmentation x{strength:.2f}"
 
         print(message)
         return {
@@ -209,6 +211,7 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
             "consistency_weight": weight,
             "val_loss": teacher_val,
             "student_val_loss": student_val,
+            "augment_strength": strength,
         }
 
     # Saved/restored by run_training.py so resumed sessions continue seamlessly
@@ -217,14 +220,14 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
         return {
             "optimizer": to_cpu(optimizer.state_dict()),
             "student": to_cpu(student.state_dict()),
-            "best_val_loss": best_val_loss,
+            **augmentation.state_dict(),
         }
 
     def set_state(state: dict) -> None:
-        nonlocal best_val_loss, first_step
+        nonlocal first_step
         student.load_state_dict(state["student"])
         optimizer.load_state_dict(state["optimizer"])
-        best_val_loss = state.get("best_val_loss", float("inf"))
+        augmentation.load_state_dict(state)
         first_step = False  # Student restored, don't overwrite it with the Teacher
 
     train_step.get_state = get_state

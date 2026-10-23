@@ -30,6 +30,14 @@ python run_training.py --method bc --minutes 5 --data a --name bc_final --device
 ```
 Models are always saved as CPU tensors, so a model trained on the GPU works in `server/ModelServer.py` on any computer.
 
+Several intervals in a row, e.g. 6 x 5 minutes unattended:
+```
+python run_training.py --method bc --minutes 5 --intervals 6 --data a --name bc_final --device cuda
+```
+After each interval the model is saved as `temp_models/bc_final_session1.pt` ... `_session5.pt`, and after the last one as
+`bc_final_final.pt`. The iterations per interval are printed in a table at the end and logged to
+`training_logs/bc_final_intervals.csv`. `bc_final_best.pt` is always the model with the lowest validation loss.
+
 `--method rl` in `run_training.py` only trains in `SimulatedCubeEnv`, a simple 2D stand-in for testing the PPO code. Real RL training runs inside Webots, see below.
 
 ## RL training in Webots (Windows + NVIDIA GPU)

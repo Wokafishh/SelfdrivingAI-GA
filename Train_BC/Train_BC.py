@@ -14,6 +14,7 @@ from torch import nn, optim
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from arkitektur import DrivingNetwork
 from training_common import (
+    AugmentationSchedule,
     DrivingDataset,
     action_loss,
     augment_labeled_batch,
@@ -82,16 +83,17 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
         print(f"[DIAGNOSTIC WARNING] Sanity check encountered an issue: {e}")
     print("[DIAGNOSTIC] Sanity check complete.\n")
 
-    best_val_loss = float("inf")
+    augmentation = AugmentationSchedule()
 
     def train_step(epoch: int) -> dict:
         """Runs one full pass over the training data and returns its metrics."""
-        nonlocal best_val_loss
         model.train()
         total_loss = torch.zeros((), device=device)
 
         for batch_idx, idx in enumerate(batch_indices(len(train_set), batch_size, device), start=1):
-            images, actions = augment_labeled_batch(to_float_images(train_set.images[idx]), train_set.actions[idx])
+            images, actions = augment_labeled_batch(
+                to_float_images(train_set.images[idx]), train_set.actions[idx], augmentation.strength
+            )
 
             optimizer.zero_grad()
             loss, pred_left, pred_right = action_loss(model, criterion, images, actions)
@@ -110,26 +112,26 @@ def setup(lr: float = 1e-3, data_files=None, device="cpu"):
 
         train_loss = total_loss.item() / len(train_set)
         message = f"[EPOCH {epoch}] Train loss: {train_loss:.5f}"
+        strength = augmentation.strength  # Used this epoch, may go up below
 
         val_loss = None
         if val_set is not None:
             val_loss = evaluate_loss(model, criterion, val_set)
             message += f" | Val loss: {val_loss:.5f}"
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if augmentation.update(val_loss):
                 message += "  (best so far)"
+        message += f" | Augmentation x{strength:.2f}"
 
         print(message)
-        return {"loss": train_loss, "val_loss": val_loss}
+        return {"loss": train_loss, "val_loss": val_loss, "augment_strength": strength}
 
     # Saved/restored by run_training.py so resumed sessions continue seamlessly
     def get_state() -> dict:
-        return {"optimizer": to_cpu(optimizer.state_dict()), "best_val_loss": best_val_loss}
+        return {"optimizer": to_cpu(optimizer.state_dict()), **augmentation.state_dict()}
 
     def set_state(state: dict) -> None:
-        nonlocal best_val_loss
         optimizer.load_state_dict(state["optimizer"])
-        best_val_loss = state.get("best_val_loss", float("inf"))
+        augmentation.load_state_dict(state)
 
     train_step.get_state = get_state
     train_step.set_state = set_state
