@@ -1,0 +1,7 @@
+session,started_at,method,device,stopped_by,time_limit_minutes,iterations_this_session,first_iteration,last_iteration,total_iterations,session_training_seconds,session_wall_seconds,total_training_seconds,start_loss,final_loss,snapshot,final_val_loss,final_augment_strength
+1,2026-10-23T14:01:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,577,1,577,577,299.531,300.003,299.531,0.179298,0.084583,temp_models\bc_final_session1.pt,0.164323,2.0
+2,2026-10-23T14:06:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,563,578,1140,1140,299.722,300.002,599.253,0.085001,0.080669,temp_models\bc_final_session2.pt,0.169652,2.0
+3,2026-10-23T14:11:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,507,1141,1647,1647,299.754,300.002,899.007,0.07911,0.074108,temp_models\bc_final_session3.pt,0.160139,2.0
+4,2026-10-23T14:16:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,561,1648,2208,2208,299.93,300.003,1198.937,0.075422,0.076596,temp_models\bc_final_session4.pt,0.16042,2.0
+5,2026-10-23T14:21:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,505,2209,2713,2713,299.994,300.021,1498.932,0.074855,0.075536,temp_models\bc_final_session5.pt,0.162106,2.0
+6,2026-10-23T14:26:18,Behaviour Cloning (BC),cuda (NVIDIA GeForce RTX 3060),time_limit,5.0,549,2714,3262,3262,299.785,300.013,1798.717,0.074453,0.075835,temp_models\bc_final_final.pt,0.158072,2.0

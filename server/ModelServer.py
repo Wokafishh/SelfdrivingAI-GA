@@ -5,6 +5,8 @@ import threading
 import time
 import io
 import os
+import csv
+from datetime import datetime
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -19,6 +21,10 @@ try:
     import torch
     from arkitektur import DrivingNetwork, preprocess_image
     TORCH_AVAILABLE = True
+    # The network is tiny, so splitting it across cores costs more than it saves
+    torch.set_num_threads(1)
+    # BC/SemiSL weights contain lots of denormal floats (~1e-40) which are extremely slow on CPU
+    torch.set_flush_denormal(True)
 except ImportError:
     TORCH_AVAILABLE = False
 
@@ -53,6 +59,15 @@ class ESP32StreamerApp:
         self.flashlight_var = tk.BooleanVar(value=False)
         self.input_only_var = tk.BooleanVar(value=False)
         self.min_output_var = tk.DoubleVar(value=DEFAULT_MIN_OUTPUT)
+        self.record_directions_var = tk.BooleanVar(value=False)
+
+        # Direction change log (written to ../modelserverlogs while recording is on)
+        self.logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "modelserverlogs"))
+        self.log_file = None
+        self.log_writer = None
+        self.log_start_time = None
+        self.log_change_count = 0
+        self.last_direction = None
 
         # PyTorch Model state & directory setup (targeting ../temp_models)
         self.model = None
@@ -191,6 +206,17 @@ class ESP32StreamerApp:
         self.scale_min_output.pack(anchor="w", fill=tk.X, pady=(2, 4))
         self._on_min_output_change()
 
+        self.chk_record_directions = ttk.Checkbutton(
+            self.control_panel,
+            text="Record direction changes (../modelserverlogs)",
+            variable=self.record_directions_var,
+            command=self._on_record_toggle
+        )
+        self.chk_record_directions.pack(anchor="w", pady=(8, 0))
+
+        self.lbl_record_status = ttk.Label(self.control_panel, text="Recording: off", font=("Helvetica", 9, "italic"), foreground="#7f8c8d")
+        self.lbl_record_status.pack(anchor="w")
+
         ttk.Separator(self.control_panel, orient="horizontal").pack(fill=tk.X, pady=10)
 
         # Active Command Display
@@ -269,11 +295,21 @@ class ESP32StreamerApp:
                 else:
                     self.model = loaded_obj
 
+                # Zero out denormal weights too, in case the CPU doesn't support flush_denormal
+                if hasattr(self.model, 'parameters'):
+                    tiny = torch.finfo(torch.float32).tiny
+                    with torch.no_grad():
+                        for tensor in list(self.model.parameters()) + list(self.model.buffers()):
+                            if tensor.is_floating_point():
+                                tensor[tensor.abs() < tiny] = 0.0
+
                 if hasattr(self.model, 'eval'):
                     self.model.eval()
 
                 self.model_path = file_path
                 self.lbl_model_info.config(text=f"Loaded: {display_label}", foreground="#27ae60")
+                if self.log_writer is not None:
+                    self._start_direction_log()
                 self.manual_control_var.set(False)
                 self._on_mode_change()
             except Exception as e:
@@ -311,6 +347,58 @@ class ESP32StreamerApp:
         scale = minimum / strongest
         return (left * scale, right * scale)
 
+    def _on_record_toggle(self):
+        if self.record_directions_var.get():
+            self._start_direction_log()
+        else:
+            self._stop_direction_log()
+
+    def _start_direction_log(self):
+        """Opens a new CSV named <date>_<time>_<model>.csv in ../modelserverlogs."""
+        self._stop_direction_log()
+        os.makedirs(self.logs_dir, exist_ok=True)
+        model_name = os.path.splitext(os.path.basename(self.model_path))[0] if self.model_path else "no_model"
+        file_name = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{model_name}.csv"
+        log_path = os.path.join(self.logs_dir, file_name)
+        try:
+            self.log_file = open(log_path, "w", newline="")
+        except OSError as e:
+            print(f"[LOG ERROR] {e}")
+            self.record_directions_var.set(False)
+            self.lbl_record_status.config(text=f"Recording failed: {str(e)[:30]}", foreground="#c0392b")
+            return
+        self.log_writer = csv.writer(self.log_file)
+        self.log_writer.writerow(["timestamp", "elapsed_s", "mode", "from_direction", "to_direction", "left", "right"])
+        self.log_start_time = time.time()
+        self.log_change_count = 0
+        self.last_direction = None
+        self.lbl_record_status.config(text=f"Recording: {file_name}", foreground="#c0392b")
+        print(f"[LOG] Recording direction changes to {log_path}")
+
+    def _stop_direction_log(self):
+        if self.log_file is not None:
+            self.log_file.close()
+            print(f"[LOG] Stopped recording ({self.log_change_count} direction changes)")
+        self.log_file = None
+        self.log_writer = None
+        self.lbl_record_status.config(text="Recording: off", foreground="#7f8c8d")
+
+    def _log_direction(self, direction, cmd):
+        """Writes a row only when the direction differs from the previous command's."""
+        if self.log_writer is None or direction == self.last_direction:
+            return
+        mode = "manual" if self.manual_control_var.get() else "ai"
+        self.log_writer.writerow([
+            datetime.now().isoformat(timespec="milliseconds"),
+            f"{time.time() - self.log_start_time:.3f}",
+            mode, self.last_direction or "", direction,
+            f"{cmd[0]:.3f}", f"{cmd[1]:.3f}"
+        ])
+        self.log_file.flush()
+        self.last_direction = direction
+        self.log_change_count += 1
+        self.lbl_record_status.config(text=f"Recording: {os.path.basename(self.log_file.name)} ({self.log_change_count} changes)")
+
     def _show_ai_diagnostic(self, raw_cmd, sent_cmd):
         """Shows the raw network output next to the (possibly scaled up) command that is sent."""
         strongest = max(abs(raw_cmd[0]), abs(raw_cmd[1]))
@@ -318,7 +406,6 @@ class ESP32StreamerApp:
         scale_text = f"x{scale:.2f} (min output {self.min_output_var.get():g})" if abs(scale - 1.0) > 1e-3 else "unchanged"
         self.lbl_ai_raw.config(text=f"Model output (raw): L {raw_cmd[0]:+.3f}  R {raw_cmd[1]:+.3f}")
         self.lbl_ai_sent.config(text=f"Sent to motors:     L {sent_cmd[0]:+.3f}  R {sent_cmd[1]:+.3f}  {scale_text}")
-        print(f"[AI] Raw L {raw_cmd[0]:+.4f} R {raw_cmd[1]:+.4f} -> Sent L {sent_cmd[0]:+.4f} R {sent_cmd[1]:+.4f} | {scale_text}")
 
     def _load_model_inference(self, pil_img):
             """Passes the incoming PIL image through DrivingNetwork with robust diagnostics."""
@@ -440,20 +527,25 @@ class ESP32StreamerApp:
 
         self.root.after(25, self._update_motor_interpolation)
 
-    def _update_command_visual(self, cmd):
+    @staticmethod
+    def _classify_direction(cmd):
+        """Returns (direction name, display color) for a (left, right) motor command."""
         l, r = cmd
         if abs(l) < 0.05 and abs(r) < 0.05:
-            text, color = "STOP (0.00, 0.00)", "#7f8c8d"
-        elif l > 0 and r > 0:
-            if abs(l - r) < 0.1: text, color = f"FWD ({l:.2f}, {r:.2f})", "#27ae60"
-            elif l > r: text, color = f"CURVE RIGHT ({l:.2f}, {r:.2f})", "#2980b9"
-            else: text, color = f"CURVE LEFT ({l:.2f}, {r:.2f})", "#2980b9"
-        elif l < 0 and r < 0:
-            text, color = f"BACK ({l:.2f}, {r:.2f})", "#c0392b"
-        else:
-            text, color = f"PIVOT ({l:.2f}, {r:.2f})", "#e67e22"
+            return "STOP", "#7f8c8d"
+        if l > 0 and r > 0:
+            if abs(l - r) < 0.1: return "FWD", "#27ae60"
+            return ("CURVE RIGHT" if l > r else "CURVE LEFT"), "#2980b9"
+        if l < 0 and r < 0:
+            return "BACK", "#c0392b"
+        return "PIVOT", "#e67e22"
 
+    def _update_command_visual(self, cmd):
+        l, r = cmd
+        direction, color = self._classify_direction(cmd)
+        text = "STOP (0.00, 0.00)" if direction == "STOP" else f"{direction} ({l:.2f}, {r:.2f})"
         self.lbl_cmd_visual.config(text=text, foreground=color)
+        self._log_direction(direction, cmd)
 
     def _send_current_command(self):
         self._send_control_packet(self.current_cmd)
@@ -529,9 +621,12 @@ class ESP32StreamerApp:
 
     def _process_frames(self):
         try:
+            # Only the newest frame matters; older ones would make the car react to the past
+            jpeg_bytes = None
             while not self.incoming_queue.empty():
                 jpeg_bytes = self.incoming_queue.get_nowait()
 
+            if jpeg_bytes is not None:
                 img = Image.open(io.BytesIO(jpeg_bytes))
                 img.load()
 
@@ -539,10 +634,11 @@ class ESP32StreamerApp:
                 if not self.manual_control_var.get():
                     raw_cmd = self._load_model_inference(img)
                     ai_cmd = self._apply_min_output(raw_cmd)
-                    self._show_ai_diagnostic(raw_cmd, ai_cmd)
+                    # Send before touching the UI so the car gets the command as early as possible
                     self.current_cmd = ai_cmd
-                    self._update_command_visual(ai_cmd)
                     self._send_control_packet(ai_cmd)
+                    self._show_ai_diagnostic(raw_cmd, ai_cmd)
+                    self._update_command_visual(ai_cmd)
 
                 img_view = img.resize((640, 640), Image.Resampling.BILINEAR)
                 self.tk_img = ImageTk.PhotoImage(img_view)
@@ -558,4 +654,9 @@ class ESP32StreamerApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = ESP32StreamerApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # The window is gone here, so close the log file directly instead of updating labels
+        if app.log_file is not None:
+            app.log_file.close()

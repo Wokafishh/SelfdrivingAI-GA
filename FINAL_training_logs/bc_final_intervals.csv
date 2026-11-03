@@ -1,0 +1,7 @@
+run_started_at,interval,planned_intervals,session,stopped_by,iterations,total_iterations,minutes,final_loss,final_val_loss,snapshot
+2026-10-23T14:01:18,1,6,1,time_limit,577,577,4.992,0.084583,0.164323,temp_models\bc_final_session1.pt
+2026-10-23T14:01:18,2,6,2,time_limit,563,1140,4.995,0.080669,0.169652,temp_models\bc_final_session2.pt
+2026-10-23T14:01:18,3,6,3,time_limit,507,1647,4.996,0.074108,0.160139,temp_models\bc_final_session3.pt
+2026-10-23T14:01:18,4,6,4,time_limit,561,2208,4.999,0.076596,0.16042,temp_models\bc_final_session4.pt
+2026-10-23T14:01:18,5,6,5,time_limit,505,2713,5.0,0.075536,0.162106,temp_models\bc_final_session5.pt
+2026-10-23T14:01:18,6,6,6,time_limit,549,3262,4.996,0.075835,0.158072,temp_models\bc_final_final.pt

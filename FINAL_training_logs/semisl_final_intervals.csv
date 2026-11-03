@@ -1,0 +1,7 @@
+run_started_at,interval,planned_intervals,session,stopped_by,iterations,total_iterations,minutes,final_loss,final_val_loss,snapshot
+2026-10-23T15:05:47,1,6,1,time_limit,266,266,4.998,0.092031,0.182229,temp_models\semisl_final_session1.pt
+2026-10-23T15:05:47,2,6,2,time_limit,267,533,4.986,0.086224,0.211747,temp_models\semisl_final_session2.pt
+2026-10-23T15:05:47,3,6,3,time_limit,268,801,4.998,0.080255,0.211659,temp_models\semisl_final_session3.pt
+2026-10-23T15:05:47,4,6,4,time_limit,265,1066,4.997,0.083619,0.207664,temp_models\semisl_final_session4.pt
+2026-10-23T15:05:47,5,6,5,time_limit,268,1334,4.983,0.080296,0.213957,temp_models\semisl_final_session5.pt
+2026-10-23T15:05:47,6,6,6,time_limit,269,1603,4.991,0.085663,0.228242,temp_models\semisl_final_final.pt
